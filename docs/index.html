@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-steward — a quality gate and spend auditor for your AI agent fleet</title>
+<meta name="description" content="Machines check what machines can check, you judge only what needs judgment, and every dollar gets a task-level justification. Measured: 68% spend saved with quality flat.">
+<style>
+  :root{
+    --ink:#1B1F23; --porcelain:#F1F3F2; --teal:#0E7C66; --teal-bright:#2FB79A;
+    --amber:#E8A13D; --slate:#5A6670; --card:#FFFFFF; --line:#DDE2E1; --well:#14171A;
+  }
+  *{box-sizing:border-box; margin:0}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion: reduce){ html{scroll-behavior:auto} }
+  body{
+    background:var(--porcelain); color:var(--ink);
+    font-family:"Avenir Next","Futura","Helvetica Neue",Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased; line-height:1.55;
+  }
+  .wrap{max-width:920px; margin:0 auto; padding:0 24px}
+  a{color:var(--teal); text-decoration:none}
+  a:hover{text-decoration:underline}
+  a:focus-visible, .btn:focus-visible{outline:3px solid var(--amber); outline-offset:2px}
+  .mono{font-family:"SF Mono",ui-monospace,Menlo,monospace}
+
+  /* hero */
+  header{padding:72px 0 56px}
+  .hero{display:grid; grid-template-columns:1fr auto; gap:36px; align-items:start}
+  @media (max-width:680px){ .hero{grid-template-columns:1fr} .hero svg{order:-1} }
+  h1{font-size:44px; font-weight:600; letter-spacing:-.015em; line-height:1.1; text-wrap:balance}
+  .tag{font-size:19px; color:var(--slate); margin:16px 0 26px; max-width:56ch; text-wrap:balance}
+  .tag b{color:var(--ink); font-weight:600}
+  .install{
+    display:inline-flex; align-items:center; gap:14px; background:var(--well);
+    color:#DDE6E2; border-radius:8px; padding:13px 20px; font-size:15px;
+  }
+  .install .p{color:var(--teal-bright)}
+  .links{margin-top:14px; font-size:14.5px; color:var(--slate)}
+  .links a{margin-right:18px}
+
+  /* sections */
+  section{padding:34px 0}
+  h2{font-size:13px; font-weight:600; letter-spacing:.14em; text-transform:uppercase;
+     color:var(--teal); margin-bottom:18px; font-family:"SF Mono",ui-monospace,Menlo,monospace}
+  .prose{font-size:16.5px; max-width:68ch}
+  .prose + .prose{margin-top:12px}
+  .prose b{font-weight:600}
+
+  .numbers{display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:14px; margin-top:6px}
+  .num{background:var(--card); border:1px solid var(--line); border-radius:10px; padding:20px 22px}
+  .num .v{font-size:30px; font-weight:600; letter-spacing:-.01em; font-variant-numeric:tabular-nums}
+  .num .v em{font-style:normal; color:var(--amber)}
+  .num .k{font-size:13.5px; color:var(--slate); margin-top:6px; line-height:1.45}
+
+  .loop{
+    background:var(--well); color:#C6CFCB; border-radius:12px; padding:30px 32px;
+    font-size:16px; line-height:1.7;
+  }
+  .loop b{color:#fff; font-weight:600}
+  .loop .arrow{color:var(--amber)}
+
+  .steps{display:grid; gap:0; background:var(--card); border:1px solid var(--line); border-radius:10px}
+  .step{display:grid; grid-template-columns:150px 1fr; gap:18px; padding:18px 22px; font-size:15.5px}
+  .step + .step{border-top:1px solid var(--line)}
+  .step .who{color:var(--slate); font-size:13px; letter-spacing:.06em; text-transform:uppercase; padding-top:3px}
+  .step b{font-weight:600}
+  @media (max-width:560px){ .step{grid-template-columns:1fr; gap:4px} }
+
+  pre.prompt{
+    background:var(--well); color:#DDE6E2; border-radius:10px; padding:22px 24px;
+    font-size:13.5px; line-height:1.65; overflow-x:auto;
+    font-family:"SF Mono",ui-monospace,Menlo,monospace;
+  }
+  pre.prompt .c{color:#7d8a86}
+
+  footer{padding:44px 0 64px; color:var(--slate); font-size:14px; border-top:1px solid var(--line); margin-top:40px}
+  footer a{margin-right:18px}
+  .canary-line{color:var(--slate); font-size:14px; margin-top:10px}
+  .canary-line b{color:var(--amber); font-weight:600}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<header>
+  <div class="hero">
+    <div>
+      <h1>Your agents did 300 things last night.<br>Which five need you?</h1>
+      <p class="tag"><b>agent-steward</b> is a quality gate and spend auditor for AI agent fleets: it checks their output against <b>your own rules</b>, meters every token from the transcripts your harness already writes, and shows you only what genuinely needs human judgment.</p>
+      <div class="install mono"><span class="p">$</span> pipx install agent-steward</div>
+      <p class="links">
+        <a href="https://github.com/michaelchen73092/agent-steward">GitHub</a>
+        <a href="https://pypi.org/project/agent-steward/">PyPI</a>
+        <a href="https://github.com/michaelchen73092/agent-steward/blob/main/docs/REFERENCE.md">Reference</a>
+        <span>MIT · zero network by default · read-only on your repo</span>
+      </p>
+    </div>
+    <svg viewBox="0 0 48 48" width="150" height="150" role="img" aria-label="the canary — agent-steward's mark">
+      <rect x="0" y="0" width="48" height="48" rx="10" fill="#FFFFFF"/>
+      <circle cx="24" cy="24" r="18" stroke="#0E7C66" stroke-width="3.6" fill="none"/>
+      <circle cx="21" cy="27" r="8.2" fill="#E8A13D"/>
+      <circle cx="29" cy="18.5" r="5.3" fill="#E8A13D"/>
+      <path d="M33.8 16.6 L38.8 18.5 L33.8 20.8 Z" fill="#1B1F23"/>
+      <circle cx="30.3" cy="17.4" r="1.25" fill="#1B1F23"/>
+      <path d="M14.5 30.8 L9.5 34.2" stroke="#E8A13D" stroke-width="3.2" stroke-linecap="round"/>
+    </svg>
+  </div>
+</header>
+
+<section>
+  <h2>The problem</h2>
+  <p class="prose">When one agent does one task, you review it yourself. When a fleet does hundreds a day, you can't — so you either review everything (you're the bottleneck), review nothing (silent errors compound), or cap spending with a blunt dollar limit that can't tell money well spent from money wasted.</p>
+  <p class="prose">There's a fourth option: <b>machines check what machines can check, you judge only what needs judgment, and every dollar gets a task-level justification.</b></p>
+</section>
+
+<section>
+  <h2>Measured, not promised</h2>
+  <div class="numbers">
+    <div class="num"><div class="v">68<em>%</em></div><div class="k">estimated spend saved vs running everything on the top model — escaped-defect rate unchanged (0.0009)</div></div>
+    <div class="num"><div class="v">289 → <em>5</em></div><div class="k">a week of flagged items compressed into the decisions that actually needed a human</div></div>
+    <div class="num"><div class="v">4<em>×</em></div><div class="k">real spend vs what hand-logged estimates had recorded — measured straight from session transcripts</div></div>
+    <div class="num"><div class="v">6 <em>min</em></div><div class="k">to onboard two projects the tool had never seen, using zero new check types</div></div>
+  </div>
+  <p class="canary-line">Every number above is reproducible from the ledgers the tool writes. <b>Teal does the checking; amber is the one thing that needs you.</b></p>
+</section>
+
+<section>
+  <h2>One loop, four verbs</h2>
+  <div class="loop">
+    <b>Verify</b> — your written rules become deterministic checks that run after every agent session <span class="arrow">→</span>
+    <b>Allocate</b> — every task class gets a model tier; failures escalate up, canary shadow-runs prove where cheaper holds quality <span class="arrow">→</span>
+    <b>Fix</b> — findings arrive grouped by category, each row stating how it gets fixed and who may fix it; you authorize in one sentence <span class="arrow">→</span>
+    <b>Judge less</b> — everything the loop learns shrinks what reaches you next round. <b>Cheapest at the same quality, never cheapest at any quality.</b>
+  </div>
+</section>
+
+<section>
+  <h2>Who does what</h2>
+  <div class="steps">
+    <div class="step"><span class="who">steward</span><span>Checks, meters, sorts, and <b>proposes</b> — tier changes, rule candidates, an ordering of your attention. It never edits your files, never decides, never phones home.</span></div>
+    <div class="step"><span class="who">your agent</span><span>Drafts the rules from your own docs, fixes only the categories you authorize, self-repairs new violations the hook feeds back after each session.</span></div>
+    <div class="step"><span class="who">you</span><span>Read one section — <b>“What needs you”</b> — and make the calls no machine may make: rule conflicts, tier floors, quality verdicts. Most days that's under five items.</span></div>
+  </div>
+</section>
+
+<section>
+  <h2>Set it up with one prompt</h2>
+  <p class="prose" style="margin-bottom:14px">Open an agent session inside your project and paste:</p>
+  <pre class="prompt">Set up agent-steward for this project:
+1. Install it: pipx install agent-steward
+2. Run `steward init --out steward.yaml`, read the rubric it prints, and fill in
+   the skeleton from THIS project's own written rules (CLAUDE.md, docs/, schemas).
+3. Show me the drafted steward.yaml — walk me through only the decisions that
+   are mine (severities, tier floors).
+4. After I approve: steward baseline, steward install-hook, steward ingest-usage.
+5. Run `steward report` and explain the "What needs you" section to me.
+<span class="c"># from then on: the hook runs after every session, `steward report` is your dashboard</span></pre>
+</section>
+
+<footer>
+  <a href="https://github.com/michaelchen73092/agent-steward">GitHub</a>
+  <a href="https://pypi.org/project/agent-steward/">PyPI</a>
+  <a href="https://github.com/michaelchen73092/agent-steward/blob/main/CHANGELOG.md">Changelog</a>
+  <a href="https://github.com/michaelchen73092/agent-steward/blob/main/SECURITY.md">Security</a>
+  <span>MIT © 2026 Wei-Chih Chen</span>
+</footer>
+</div>
+</body>
+</html>
