@@ -6,6 +6,7 @@
 [![CI](https://github.com/michaelchen73092/agent-steward/actions/workflows/ci.yml/badge.svg)](https://github.com/michaelchen73092/agent-steward/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/pypi/pyversions/agent-steward)](https://pypi.org/project/agent-steward/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Site](https://img.shields.io/badge/site-github.io-0E7C66)](https://michaelchen73092.github.io/agent-steward/)
 
 **A quality gate and spend auditor for your AI agent fleet.**
 
