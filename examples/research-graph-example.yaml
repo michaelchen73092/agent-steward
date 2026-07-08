@@ -1,0 +1,136 @@
+# agent-steward manifest — a research knowledge graph (APPLY target)
+# Generic example for any project where agents write knowledge nodes
+# (facts / insights with YAML frontmatter) under written epistemic rules.
+# Drafted the way `steward init`'s rubric teaches: observe-first (all warn),
+# every probe carries source provenance, a fix note, and a risk weight.
+project: research-graph-example
+root: /path/to/your/project   # or pass --root at runtime
+mode: apply
+
+probes:
+  # --- data floor: state files the pipeline depends on ---
+  - id: decision-log-wellformed
+    fixable_by: agent
+    fix: "a corrupt line = a crashed write; quarantine the line and re-run the decision that produced it"
+    risk_weight: 2.0            # a broken decision log severs your audit trail
+    type: jsonl_wellformed
+    path: state/decision_log.jsonl
+    source: "CLAUDE.md rule: every adjudication round appends to the log"
+
+  # --- schema floor: nodes must carry their verifiable fields ---
+  - id: fact-schema
+    fixable_by: agent
+    fix: "fill the missing frontmatter fields from the source document"
+    risk_weight: 1.5
+    type: frontmatter_required
+    glob: "facts/**/*.md"
+    required: [id, statement, sources, confidence]
+    severity: warn              # observe first — measure false positives before enforcing
+    source: "docs/schema.md (facts carry verifiable fields)"
+  - id: origin-enum
+    fixable_by: agent
+    fix: "set origin to expert|user|synthesis per who originated the idea"
+    risk_weight: 1.2
+    type: field_value_rule
+    glob: "insights/**/*.md"
+    field: origin
+    allowed: [expert, user, synthesis]
+    severity: warn
+    source: "CLAUDE.md rule: insights declare their origin"
+
+  # --- epistemics floor: single-source claims are capped ---
+  - id: single-source-cap
+    fixable_by: agent
+    fix: "lower confidence to the class cap, or add a genuinely independent second source; documented exemptions (an exempt field + reason) are a human call"
+    risk_weight: 1.2
+    type: single_source_cap
+    glob: "facts/**/*.md"
+    default_cap: 0.5
+    class_caps:                 # copied from the rule doc — so pin the quotes:
+      self_declarative: 0.9     # official announcements about one's own actions
+      attributed_statement: 0.9 # "X said Y" — the saying is the fact
+    severity: warn
+    source: "docs/epistemics.md §claim classes"
+    source_file: docs/epistemics.md   # anti-transcription guard: if the doc's
+    source_quote:                     # numbers change, you get ONE source-drift
+      - "self_declarative claims cap at 0.9"      # alert instead of a storm
+      - "single-source world claims cap at 0.5"
+
+  # --- graph integrity: edges must point at nodes that exist ---
+  - id: edge-ref-integrity
+    fixable_by: agent
+    fix: "fix the dangling id (usually a typo) or create the missing node"
+    risk_weight: 1.8
+    type: ref_integrity
+    glob: ["facts/**/*.md", "insights/**/*.md"]
+    field: [edges.to, builds_on]      # nested edge lists and flat refs both checked
+    target_glob: ["facts/**/*.md", "insights/**/*.md", "entities/*.md"]
+    id_field: id
+    severity: warn
+    source: "CLAUDE.md rule: contradiction edges are first-class"
+
+  # --- freshness: unverified claims may not rot silently ---
+  - id: stale-unverified
+    fixable_by: agent
+    fix: "verify the claim against the web and flip its status, or archive it"
+    type: staleness_flag
+    glob: "facts/**/*.md"
+    where: {verification_status: unverified}
+    max_age_days: 30
+    severity: warn
+    source: "CLAUDE.md rule: model-generated claims stay unverified until checked"
+
+  # --- spend compliance (Level 2+): stamps vs the tier table ---
+  - id: allocation-compliance
+    fixable_by: human
+    fix: "usually a dispatch-discipline event: remind the dispatcher of cheap-first, or re-assess the tier via allocate tune — stamps are history, never rewrite them"
+    risk_weight: 0.5
+    type: allocation_compliance
+    glob: ["facts/**/*.md", "insights/**/*.md"]
+    allocation_file: .allocation.yaml   # absent -> probe reports skipped, no noise
+    severity: warn
+    source: "CLAUDE.md rule: model tiering policy"
+
+# Optional L1 judge (route --judge): scores leftovers for judgment-worthiness.
+# Runs on your own logged-in `claude` CLI; no API key needed.
+judge:
+  model: claude-haiku-4-5
+  rubric: |
+    - Items whose signal is already carried by existing nodes are
+      machine-decidable noise -> score 0.1.
+    - Rule-parameter contradictions (a manifest number disagreeing with the
+      rule doc it cites) always need a human -> score 1.0.
+
+# M5 rule coverage: EVERY written rule, each covered / judgment-only / uncovered.
+rulebook:
+  - rule: "Insights are admitted only when they add a new node, edge, or evidence"
+    source: "CLAUDE.md rule 1"
+    judgment_only: true
+  - rule: "Single-source claims are confidence-capped, class-dependent"
+    source: "docs/epistemics.md"
+    covered_by: [single-source-cap]
+  - rule: "Facts carry verifiable fields"
+    source: "docs/schema.md"
+    covered_by: [fact-schema]
+  - rule: "Insights declare origin"
+    source: "CLAUDE.md rule 5"
+    covered_by: [origin-enum]
+  - rule: "Edges point at existing nodes; contradictions are preserved, not dropped"
+    source: "CLAUDE.md rule 7"
+    covered_by: [edge-ref-integrity]
+  - rule: "Unverified claims are re-checked within 30 days"
+    source: "CLAUDE.md rule 4"
+    covered_by: [stale-unverified]
+  - rule: "Every adjudication round appends to the decision log"
+    source: "CLAUDE.md rule 5"
+    covered_by: [decision-log-wellformed]
+
+metrics:
+  - { id: facts_total,      type: frontmatter_count, glob: "facts/**/*.md" }
+  - { id: facts_unverified, type: frontmatter_count, glob: "facts/**/*.md", where: {verification_status: unverified} }
+  - { id: superseded,       type: frontmatter_count, glob: "facts/**/*.md", where: {superseded_at: "!null"} }
+  - { id: git_commits_7d,   type: git_commits, days: 7 }
+
+derived:
+  - { id: unverified_ratio,    expr: "facts_unverified / facts_total if facts_total else None" }
+  - { id: escaped_defect_rate, expr: "superseded / facts_total if facts_total else None" }

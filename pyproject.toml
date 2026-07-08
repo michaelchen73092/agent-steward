@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-steward"
+version = "0.18.0"
+description = "A quality gate and spend auditor for your AI agent fleet."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Wei-Chih Chen", email = "michaelchen73092@gmail.com" }]
+requires-python = ">=3.9"
+dependencies = ["pyyaml>=6.0"]
+keywords = ["ai-agents", "quality-gate", "llm", "verification", "cost-optimization"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+steward = "agent_steward.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/michaelchen73092/agent-steward"
+Repository = "https://github.com/michaelchen73092/agent-steward"
+Issues = "https://github.com/michaelchen73092/agent-steward/issues"
+Changelog = "https://github.com/michaelchen73092/agent-steward/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_steward"]

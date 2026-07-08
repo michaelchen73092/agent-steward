@@ -1,0 +1,26 @@
+# Tokenless releases via PyPI Trusted Publishing (OIDC).
+# One-time setup on pypi.org: project agent-steward -> Publishing ->
+# add GitHub publisher (owner: michaelchen73092, repo: agent-steward,
+# workflow: release.yml). After that: `git tag v0.17.0 && git push --tags`
+# publishes — no API token exists anywhere.
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read    # explicit: a permissions block REPLACES the defaults
+      id-token: write   # OIDC — this replaces the API token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build pyyaml pytest
+      - run: python -m pytest tests/ -q
+      - run: python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1

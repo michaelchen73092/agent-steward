@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+.ruff_cache/
+# steward's own runtime outputs (when dogfooding on this repo)
+.steward/
+runs/
+.pytest_cache/
+.DS_Store
+local/

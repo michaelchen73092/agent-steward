@@ -1,0 +1,88 @@
+# agent-steward manifest — a personal knowledge/practice system (APPLY target)
+# ANONYMIZED example: shows how a solo, non-code markdown repo (daily journals,
+# a habit-tracking CSV, framework notes) gets a verification floor with zero
+# new probe types. Authored per the `steward init` rubric. Observe-first.
+project: personal-knowledge-os
+root: /path/to/your/project   # or pass --root at runtime
+mode: apply
+
+probes:
+  # --- data floor ---
+  - id: tracker-csv-columns               # the daily-tracking CSV schema (all downstream automation depends on it)
+    fixable_by: agent
+    fix: "re-append the row with the full column set; the schema file names them"
+    risk_weight: 2.0    # broken columns = broken scoring and trends
+    type: csv_required_columns
+    glob: tracking/daily_log.csv
+    columns: [date, score, tier]
+    severity: warn
+    source: "docs/tracking-SOP.md (CSV append step)"
+  - id: tracker-fresh                     # a daily duty; 7 days without an append = the SOP lapsed
+    fixable_by: human
+    fix: "the habit lapsed, not the file — resume the daily routine or retire the SOP"
+    risk_weight: 1.5
+    type: cmd
+    readonly_safe: true
+    cmd: "find tracking/daily_log.csv -mtime -7 | grep -q ."
+    on_fail: warn
+    source: "docs/tracking-SOP.md (daily duty)"
+  # --- naming conventions ---
+  - id: journal-naming                    # one dated file per day
+    fixable_by: agent
+    fix: "rename to YYYY-MM-DD.md; content is untouched"
+    type: filename_pattern
+    glob: "journals/*.md"
+    patterns: ['^\d{4}-\d{2}-\d{2}', '^README', '^_']
+    severity: warn
+    source: "journals/ convention (one dated file per day)"
+  - id: instance-naming                   # event notes must be date-stamped
+    fixable_by: agent
+    fix: "rename to YYYY-MM-DD-<event>.md"
+    type: filename_pattern
+    glob: "frameworks/examples/*.md"
+    patterns: ['^\d{4}-\d{2}-\d{2}-', '^README', '^_']
+    severity: warn
+    source: "framework SOP (dated instance files)"
+  # --- skeleton files (every session's boot sequence depends on them) ---
+  - id: anchor-exists
+    fixable_by: human
+    fix: "the orientation file moved or was deleted — restore it or update the SOP that points at it"
+    risk_weight: 1.5
+    type: file_exists
+    path: anchors/goals-anchor.md
+    source: "CLAUDE.md read-first list"
+  - id: state-file-exists
+    fixable_by: human
+    fix: "restore from git — this is the live aggregate view every session loads"
+    type: file_exists
+    path: frameworks/_ongoing-state.md
+    source: "CLAUDE.md read-first list"
+  # --- code side (automation scripts must stay runnable) ---
+  - id: scripts-shell-syntax
+    fixable_by: agent
+    fix: "fix the shell syntax; automation must stay runnable"
+    type: bash_syntax
+    glob: "scripts/*.sh"
+    source: "scripts/ (automation helpers)"
+
+rulebook:
+  - rule: "Trigger present -> run the FULL SOP, never degrade to generic handling"
+    source: "CLAUDE.md triggers"
+    judgment_only: true
+  - rule: "Daily tracking: every entry appends a full CSV row"
+    source: "docs/tracking-SOP.md"
+    covered_by: [tracker-csv-columns, tracker-fresh]
+  - rule: "Dated filenames: journals one per day, event notes date-stamped"
+    source: "journals/ + framework SOP conventions"
+    covered_by: [journal-naming, instance-naming]
+  - rule: "Read-first orientation files exist and stay in place"
+    source: "CLAUDE.md read-first list"
+    covered_by: [anchor-exists, state-file-exists]
+  - rule: "Cross-note references [[like-this]] resolve to an existing note"
+    source: "framework SOP (numbered frames, back-referencable)"
+    # uncovered — needs an in-body wiki-link integrity probe (next probe candidate)
+
+metrics:
+  - { id: journals_total,  type: file_count, glob: "journals/*.md" }
+  - { id: event_notes,     type: file_count, glob: "frameworks/examples/2*.md" }
+  - { id: git_commits_7d,  type: git_commits, days: 7 }
