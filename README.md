@@ -1,3 +1,5 @@
+<img src="https://raw.githubusercontent.com/michaelchen73092/agent-steward/main/assets/icon.svg" alt="agent-steward — the canary" width="96" align="right">
+
 # agent-steward
 
 [![PyPI](https://img.shields.io/pypi/v/agent-steward)](https://pypi.org/project/agent-steward/)

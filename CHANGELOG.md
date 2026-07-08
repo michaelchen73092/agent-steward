@@ -3,6 +3,11 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.18.1 — 2026-07-08
+- The canary gets the job: official mark (assets/icon.svg) — amber canary
+  in the steward's teal ring. Teal does the checking; amber is the one
+  thing that needs you.
+
 ## 0.17.2 — 2026-07-08
 - README rewritten reader-first: one-prompt setup, decision table
   (when/where/what/default), levels L1–L3 with per-level report shapes.

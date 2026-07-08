@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="agent-steward — the canary">
+  <!-- the canary: agent-steward's mark. Teal ring = the steward's watch;
+       amber bird = the canary shadow-run, the one thing that speaks up. -->
+  <rect x="0" y="0" width="48" height="48" rx="10" fill="#FFFFFF"/>
+  <circle cx="24" cy="24" r="18" stroke="#0E7C66" stroke-width="3.6" fill="none"/>
+  <circle cx="21" cy="27" r="8.2" fill="#E8A13D"/>
+  <circle cx="29" cy="18.5" r="5.3" fill="#E8A13D"/>
+  <path d="M33.8 16.6 L38.8 18.5 L33.8 20.8 Z" fill="#1B1F23"/>
+  <circle cx="30.3" cy="17.4" r="1.25" fill="#1B1F23"/>
+  <path d="M14.5 30.8 L9.5 34.2" stroke="#E8A13D" stroke-width="3.2" stroke-linecap="round"/>
+</svg>
