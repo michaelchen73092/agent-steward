@@ -3,6 +3,12 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.19.0 — 2026-07-08
+- `scope_guard` (14th probe): the over-delivery guard. Born from Mollick's
+  GPT-5 field test (models proactively produce unrequested artifacts) —
+  files outside your declared `expected` areas get flagged; with `--diff`
+  only new strays reach you. Proper `**` glob semantics (zero-or-more dirs).
+
 ## 0.18.1 — 2026-07-08
 - The canary gets the job: official mark (assets/icon.svg) — amber canary
   in the steward's teal ring. Teal does the checking; amber is the one

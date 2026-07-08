@@ -24,10 +24,10 @@ command, the design rule that makes it trustworthy.
 
 ## Verification (the quality gate)
 
-**13 probe types**, all deterministic and read-only: `cmd`, `jsonl_wellformed`,
+**14 probe types**, all deterministic and read-only: `cmd`, `jsonl_wellformed`,
 `frontmatter_required`, `single_source_cap`, `field_value_rule`, `bash_syntax`,
 `csv_required_columns`, `tsv_wellformed`, `file_exists`, `filename_pattern`,
-`staleness_flag`, `ref_integrity`, `allocation_compliance`.
+`staleness_flag`, `ref_integrity`, `scope_guard`, `allocation_compliance`.
 
 Design rules that keep them honest:
 
@@ -46,6 +46,11 @@ Design rules that keep them honest:
 - **Documented exceptions.** `single_source_cap` accepts `exempt_field:`
   (e.g. `g1_exempt`) — a file carrying that field with a written reason is
   skipped and counted. A reviewable exception beats a rule everyone ignores.
+- **The over-delivery guard.** Agents that "just do stuff" create files
+  nobody asked for, and checks that only ask "is the required output
+  present?" never notice. `scope_guard` flags any file outside your
+  declared `expected` areas; with `--diff`, only newly appearing strays
+  reach you.
 - **Missing tools are not violations.** A `cmd` probe whose binary is absent
   reports "missing tool — install it or fix the manifest", not a violation.
 - **Manifest pre-flight.** Every check validates the manifest first: unknown

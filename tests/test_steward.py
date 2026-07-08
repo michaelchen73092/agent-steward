@@ -300,6 +300,24 @@ def test_stamp_cli_roundtrip_with_allocation_probe(tmp_path):
     assert cli.probe_allocation_compliance(str(tmp_path), spec)["status"] == "pass"
 
 
+def test_probe_scope_guard(tmp_path):
+    """Over-delivery guard: files outside every expected area get flagged;
+    ignore patterns and the required-param contract hold."""
+    write(tmp_path, "facts/2026/ok.md", "x")
+    write(tmp_path, "notes/expected.md", "x")
+    write(tmp_path, "landing_page_draft.html", "nobody asked for this")
+    write(tmp_path, ".steward/state.json", "{}")
+    spec = {"id": "p", "expected": ["facts/**/*", "notes/**/*", "README.md"],
+            "within": "**/*", "severity": "warn"}
+    r = cli.probe_scope_guard(str(tmp_path), spec)
+    assert r["status"] == "warn" and r["n_violations"] == 1
+    assert "landing_page_draft.html" in r["violations"][0]
+    assert ".steward" not in "\n".join(r["violations"])   # default ignore
+    assert cli.probe_scope_guard(str(tmp_path), {"id": "p"})["status"] == "skipped"
+    ok = cli.probe_scope_guard(str(tmp_path), {**spec, "expected": ["**/*"]})
+    assert ok["status"] == "pass"
+
+
 def test_probe_ref_integrity(tmp_path):
     write(tmp_path, "facts/2026/a.md", "---\nid: F1\nedges:\n"
                                        "  - { to: F2, rel: contradicts }\n"

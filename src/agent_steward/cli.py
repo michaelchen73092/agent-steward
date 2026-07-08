@@ -475,6 +475,68 @@ def _tier_at(history, task, when, current):
     return tier
 
 
+def _glob_match(rel, pat):
+    """Proper ** glob semantics (zero or more directories), unlike raw
+    fnmatch where `a/**/*` refuses to match `a/x`. Used by scope_guard,
+    where 'expected areas' must mean what a human thinks they mean."""
+    out = []
+    i, pat = 0, str(pat)
+    while i < len(pat):
+        c = pat[i]
+        if c == "*":
+            if pat[i:i + 3] == "**/":
+                out.append(r"(?:.*/)?")
+                i += 3
+                continue
+            if pat[i:i + 2] == "**":
+                out.append(r".*")
+                i += 2
+                continue
+            out.append(r"[^/]*")
+        elif c == "?":
+            out.append(r"[^/]")
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.fullmatch("".join(out), rel) is not None
+
+
+def probe_scope_guard(root, spec):
+    """Wizard-mode guard (the over-delivery half of the problem): agents that
+    'just do stuff' create files nobody asked for, and checks that only ask
+    'is the required output present?' never notice. Every file under `within`
+    (default: everything) must match at least one `expected` glob — anything
+    else is out-of-scope output for a human to glance at. Pair with --diff:
+    the baseline absorbs the existing tree, so only NEWLY appearing strays
+    are reported. All globs come from the manifest; the engine has no idea
+    what a project's shape should be."""
+    expected = spec.get("expected") or []
+    expected = expected if isinstance(expected, list) else [expected]
+    if not expected:
+        return result(spec, "scope_guard", "skipped", "no expected globs configured")
+    within = spec.get("within", "**/*")
+    within = within if isinstance(within, list) else [within]
+    ignore = spec.get("ignore") or [".git/**", ".steward/**", ".claude/**",
+                                    "__pycache__/**", "node_modules/**"]
+    bad, n = [], 0
+    for dirpath, _dn, fns in os.walk(root):
+        for fn in fns:
+            rel = os.path.relpath(os.path.join(dirpath, fn), root).replace(os.sep, "/")
+            if not any(_glob_match(rel, g) for g in within):
+                continue
+            if any(_glob_match(rel, g) for g in ignore):
+                continue
+            n += 1
+            if not any(_glob_match(rel, g) for g in expected):
+                bad.append(f"{rel}: outside every expected area — nobody asked "
+                           f"for this file; keep it (then add its home to "
+                           f"`expected`) or remove it")
+    return result(spec, "scope_guard",
+                  "pass" if not bad else spec.get("severity", "warn"),
+                  f"{n} files vs {len(expected)} expected area(s)",
+                  violations=bad, n_checked=n)
+
+
 def probe_allocation_compliance(root, spec):
     """R2 loop-one sensor (observe-first): declared tier per task class vs the
     model actually recorded in each artifact's provenance stamp
@@ -573,6 +635,7 @@ PROBES = {
     "filename_pattern": probe_filename_pattern,
     "staleness_flag": probe_staleness_flag,
     "ref_integrity": probe_ref_integrity,
+    "scope_guard": probe_scope_guard,
     "allocation_compliance": probe_allocation_compliance,
 }
 
@@ -1187,6 +1250,7 @@ PROBE_PARAMS = {
     "filename_pattern": ({"glob", "patterns"}, set()),
     "staleness_flag": ({"glob", "max_age_days"}, {"where", "date_field"}),
     "ref_integrity": ({"glob", "field"}, {"target_glob", "id_field", "ignore"}),
+    "scope_guard": ({"expected"}, {"within", "ignore"}),
     "allocation_compliance": ({"glob"}, {"allocation_file", "tasks",
                                          "tier_patterns"}),
 }

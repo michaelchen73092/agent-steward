@@ -80,6 +80,17 @@ probes:
     severity: warn
     source: "CLAUDE.md rule: model-generated claims stay unverified until checked"
 
+  # --- over-delivery guard: agents that 'just do stuff' leave stray files ---
+  - id: scope-guard
+    fixable_by: human
+    fix: "an agent created a file nobody asked for — keep it (and add its home to `expected`) or remove it"
+    risk_weight: 1.3
+    type: scope_guard
+    within: "**/*.md"
+    expected: ["facts/**", "insights/**", "entities/**", "docs/**", "state/**", "*.md"]
+    severity: warn
+    source: "project convention: agent output lands only in declared areas"
+
   # --- spend compliance (Level 2+): stamps vs the tier table ---
   - id: allocation-compliance
     fixable_by: human
