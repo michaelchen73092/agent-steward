@@ -300,6 +300,20 @@ def test_stamp_cli_roundtrip_with_allocation_probe(tmp_path):
     assert cli.probe_allocation_compliance(str(tmp_path), spec)["status"] == "pass"
 
 
+def test_rglob_matches_depth_one():
+    """records/**/*.md must match records/a.md (zero-or-more dirs) — the
+    single most common first-run confusion before v0.19.1."""
+    import tempfile, os as _os
+    with tempfile.TemporaryDirectory() as d:
+        _os.makedirs(_os.path.join(d, "records", "deep"))
+        for p in ("records/a.md", "records/deep/b.md", "top.md"):
+            open(_os.path.join(d, p), "w").write("x")
+        rels = [_os.path.relpath(p, d) for p in cli.rglob(d, "records/**/*.md")]
+        assert sorted(rels) == ["records/a.md", "records/deep/b.md"]
+        assert [_os.path.relpath(p, d) for p in cli.rglob(d, "**/*.md")] == \
+            ["records/a.md", "records/deep/b.md", "top.md"]
+
+
 def test_probe_scope_guard(tmp_path):
     """Over-delivery guard: files outside every expected area get flagged;
     ignore patterns and the required-param contract hold."""

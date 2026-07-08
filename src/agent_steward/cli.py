@@ -64,14 +64,43 @@ def now_iso():
     return dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _glob_match(rel, pat):
+    """Proper ** glob semantics (zero or more directories), unlike raw
+    fnmatch where `a/**/*` refuses to match `a/x`. Used by scope_guard,
+    where 'expected areas' must mean what a human thinks they mean."""
+    out = []
+    i, pat = 0, str(pat)
+    while i < len(pat):
+        c = pat[i]
+        if c == "*":
+            if pat[i:i + 3] == "**/":
+                out.append(r"(?:.*/)?")
+                i += 3
+                continue
+            if pat[i:i + 2] == "**":
+                out.append(r".*")
+                i += 2
+                continue
+            out.append(r"[^/]*")
+        elif c == "?":
+            out.append(r"[^/]")
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.fullmatch("".join(out), rel) is not None
+
+
 def rglob(root, pattern):
-    """Recursive glob relative to root, supports **. Returns sorted paths."""
+    """Recursive glob relative to root with PROPER ** semantics (zero or
+    more directories — `records/**/*.md` matches `records/a.md` too).
+    Raw fnmatch treats ** like *, which silently skips depth-1 files: the
+    single most common first-run confusion for new users. Returns sorted paths."""
     out = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for fn in filenames:
             full = os.path.join(dirpath, fn)
-            rel = os.path.relpath(full, root)
-            if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(rel.replace(os.sep, "/"), pattern):
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            if _glob_match(rel, pattern):
                 out.append(full)
     return sorted(out)
 
@@ -473,32 +502,6 @@ def _tier_at(history, task, when, current):
         if str(h["at"]) <= str(when):
             tier = str(h.get("to", tier))
     return tier
-
-
-def _glob_match(rel, pat):
-    """Proper ** glob semantics (zero or more directories), unlike raw
-    fnmatch where `a/**/*` refuses to match `a/x`. Used by scope_guard,
-    where 'expected areas' must mean what a human thinks they mean."""
-    out = []
-    i, pat = 0, str(pat)
-    while i < len(pat):
-        c = pat[i]
-        if c == "*":
-            if pat[i:i + 3] == "**/":
-                out.append(r"(?:.*/)?")
-                i += 3
-                continue
-            if pat[i:i + 2] == "**":
-                out.append(r".*")
-                i += 2
-                continue
-            out.append(r"[^/]*")
-        elif c == "?":
-            out.append(r"[^/]")
-        else:
-            out.append(re.escape(c))
-        i += 1
-    return re.fullmatch("".join(out), rel) is not None
 
 
 def probe_scope_guard(root, spec):

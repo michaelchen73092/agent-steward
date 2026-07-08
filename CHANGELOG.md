@@ -3,6 +3,11 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.19.1 — 2026-07-08
+- Fix: `**` in every probe glob now means "zero or more directories" —
+  `records/**/*.md` matches `records/a.md`. Raw fnmatch's behavior silently
+  skipped depth-1 files, the most likely first-run confusion for new users.
+
 ## 0.19.0 — 2026-07-08
 - `scope_guard` (14th probe): the over-delivery guard. Born from Mollick's
   GPT-5 field test (models proactively produce unrequested artifacts) —
