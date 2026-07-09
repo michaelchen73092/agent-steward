@@ -40,9 +40,16 @@
 
 ## Releasing
 
-Bump `version` in `pyproject.toml`, update `CHANGELOG.md`, commit, push a
-`v*` tag. CI tests, builds, and publishes to PyPI via Trusted Publishing —
-no tokens exist anywhere.
+**Every release goes through the flywheel gate first:**
+`~/product-flywheel/S4_RELEASE_CHECKLIST.md` → §1 (all products) + §2.A
+(CLI / PyPI). Run through it before you tag; append a §4 lesson after. This
+pointer is how a release session self-finds the checklist — you don't have to
+remember where it lives.
+
+Mechanics: bump `version` in `pyproject.toml`, update `CHANGELOG.md` (link the
+air node/seed that motivated the change), commit, push a `v*` tag. CI tests,
+builds, and publishes to PyPI via Trusted Publishing — no tokens exist
+anywhere.
 
 ## Contact
 
