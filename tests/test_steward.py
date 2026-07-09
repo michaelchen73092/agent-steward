@@ -303,7 +303,8 @@ def test_stamp_cli_roundtrip_with_allocation_probe(tmp_path):
 def test_rglob_matches_depth_one():
     """records/**/*.md must match records/a.md (zero-or-more dirs) — the
     single most common first-run confusion before v0.19.1."""
-    import tempfile, os as _os
+    import os as _os
+    import tempfile
     with tempfile.TemporaryDirectory() as d:
         _os.makedirs(_os.path.join(d, "records", "deep"))
         for p in ("records/a.md", "records/deep/b.md", "top.md"):
