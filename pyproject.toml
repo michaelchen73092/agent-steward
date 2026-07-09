@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-steward"
-version = "0.19.1"
+version = "0.20.0"
 description = "A quality gate and spend auditor for your AI agent fleet."
 readme = "README.md"
 license = { text = "MIT" }

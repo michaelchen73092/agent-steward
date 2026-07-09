@@ -1156,17 +1156,45 @@ def test_install_hook(tmp_path):
     assert r.returncode == 0, r.stderr
     spath = proj / ".claude" / "settings.json"
     settings = json.loads(spath.read_text(encoding="utf-8"))
-    cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-    assert "--diff --exit-new" in cmd and str(proj) in cmd
-    # idempotent
+    stop = settings["hooks"]["Stop"]
+    cmds = [h["command"] for e in stop for h in e["hooks"]]
+    # two hooks now: check (self-repair) + report (auto cumulative report)
+    check_cmd = next(c for c in cmds if "--diff --exit-new" in c)
+    report_cmd = next(c for c in cmds if " report " in f" {c} ")
+    assert str(proj) in check_cmd
+    assert report_cmd.endswith("REPORT.md || true") and "REPORT.md" in report_cmd
+    # idempotent: re-running adds nothing
     r2 = steward_cli("install-hook", "--manifest", manifest)
     assert "already installed" in r2.stdout
-    assert len(json.loads(spath.read_text())["hooks"]["Stop"]) == 1
+    cmds2 = [h["command"] for e in json.loads(spath.read_text())["hooks"]["Stop"]
+             for h in e["hooks"]]
+    assert len(cmds2) == 2
     # merges, never clobbers existing settings
     settings["permissions"] = {"allow": ["Bash(ls:*)"]}
     spath.write_text(json.dumps(settings), encoding="utf-8")
     steward_cli("install-hook", "--manifest", manifest)  # no-op, but re-check preserved
     assert json.loads(spath.read_text())["permissions"]["allow"] == ["Bash(ls:*)"]
+
+
+def test_install_hook_upgrades_old_single_hook(tmp_path):
+    # a project installed before 0.20 has only the check hook; re-running
+    # install-hook must ADD the report hook without touching the check one.
+    proj = tmp_path / "proj"
+    write(proj, "facts/2026/ok.md", FACT_OK)
+    manifest = make_manifest(tmp_path, proj)
+    spath = proj / ".claude" / "settings.json"
+    spath.parent.mkdir(parents=True, exist_ok=True)
+    old_check = (f"steward check --manifest {manifest} --root {proj} "
+                 f"--state-dir {proj}/.steward --diff --exit-new")
+    spath.write_text(json.dumps(
+        {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": old_check}]}]}}))
+    r = steward_cli("install-hook", "--manifest", manifest)
+    assert r.returncode == 0 and "report" in r.stdout
+    cmds = [h["command"] for e in json.loads(spath.read_text())["hooks"]["Stop"]
+            for h in e["hooks"]]
+    assert len(cmds) == 2
+    assert any("--diff --exit-new" in c for c in cmds)      # check untouched
+    assert any(c.endswith("REPORT.md || true") for c in cmds)  # report added
 
 
 def test_install_hook_refuses_readonly(tmp_path):

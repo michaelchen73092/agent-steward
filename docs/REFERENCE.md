@@ -11,7 +11,7 @@ command, the design rule that makes it trustworthy.
 | `steward init [--out F]` | Print the manifest-authoring rubric; write a skeleton |
 | `steward baseline --manifest F` | First check; seeds the diff state |
 | `steward check --manifest F [--diff]` | Run all probes + metrics; `--diff` reports only changes |
-| `steward install-hook --manifest F` | Auto-run check after every agent session (Claude Code Stop hook) |
+| `steward install-hook --manifest F` | Auto-run check + refresh cumulative report after every agent session (two Claude Code Stop hooks) |
 | `steward report` | Cumulative view; opens with **What needs you** |
 | `steward route --manifest F [--judge]` | Sort leftover violations into an attention queue |
 | `steward approve <id> --verdict worth\|not-worth` | Grade a queue item (feeds M4) |
@@ -59,9 +59,14 @@ Design rules that keep them honest:
 - **Fixes scoreboard.** `check --diff` appends resolved violations to
   `fixes.jsonl`; the report shows "Fixed so far" with counts and examples.
 
-**The hook.** `install-hook` registers `check --diff --exit-new` as a Claude
-Code Stop hook: no new violations → silence; new violations → exit 2 with the
-list on stderr, which Claude Code feeds back to the agent for self-repair.
+**The hook.** `install-hook` registers two Claude Code Stop hooks: (1)
+`check --diff --exit-new` — no new violations → silence; new violations →
+exit 2 with the list on stderr, which Claude Code feeds back to the agent for
+self-repair; (2) `report --out <state-dir>/REPORT.md` — refreshes the
+cumulative report (CPAU / savings / what-needs-you) at a fixed path after
+every session, so you open one file for the latest. Projects installed before
+0.20 get the report hook added on the next `install-hook` run (the check hook
+is left untouched).
 
 ## Metering (measured, not estimated)
 

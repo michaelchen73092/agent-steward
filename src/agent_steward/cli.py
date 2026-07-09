@@ -1638,6 +1638,17 @@ def cmd_install_hook(args):
         prefix = f"{sys.executable} {os.path.abspath(__file__)}"
     command = (f"{prefix} check --manifest {manifest} --root {root} "
                f"--state-dir {sdir} --diff --exit-new")
+    # Second hook: refresh a stable cumulative report every session, so every
+    # project gets CPAU/savings/what-needs-you at a fixed path with no
+    # per-project wiring. `|| true` — a report failure must never block the
+    # check hook's self-repair loop. Written to <state-dir>/REPORT.md, which
+    # lives inside the already-gitignored state dir (fresh each run, no churn).
+    report_out = os.path.join(sdir, "REPORT.md")
+    report_cmd = f"{prefix} report --state-dir {sdir}"
+    alloc_path = os.path.join(root, ".allocation.yaml")
+    if os.path.exists(alloc_path):
+        report_cmd += f" --allocation {alloc_path}"
+    report_cmd += f" --out {report_out} || true"
 
     settings = {}
     if os.path.exists(settings_path):
@@ -1649,21 +1660,32 @@ def cmd_install_hook(args):
                   f"first; refusing to overwrite.", file=sys.stderr)
             return 1
     stop = settings.setdefault("hooks", {}).setdefault("Stop", [])
+    have_check = have_report = False
     for entry in stop:
         for h in entry.get("hooks", []):
             hcmd = h.get("command", "")
             if manifest in hcmd and "--exit-new" in hcmd:
-                print(f"[steward] hook already installed in {settings_path}")
-                return 0
-    stop.append({"hooks": [{"type": "command", "command": command}]})
+                have_check = True
+            if report_out in hcmd and " report " in f" {hcmd} ":
+                have_report = True
+    if have_check and have_report:
+        print(f"[steward] hook already installed in {settings_path}")
+        return 0
+    added = []
+    if not have_check:                       # existing installs keep their check
+        stop.append({"hooks": [{"type": "command", "command": command}]})
+        added.append("check")
+    if not have_report:                      # upgrade path: add report to old installs
+        stop.append({"hooks": [{"type": "command", "command": report_cmd}]})
+        added.append("report")
     os.makedirs(os.path.dirname(settings_path), exist_ok=True)
     with open(settings_path, "w", encoding="utf-8") as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
         f.write("\n")
-    print(f"[steward] installed Stop hook in {settings_path}\n"
-          f"          command: {command}\n"
-          f"          effect: after each agent session you see only NEW "
-          f"violations; exit 2 feeds them back to the agent.")
+    print(f"[steward] installed Stop hook(s) in {settings_path}: {', '.join(added)}\n"
+          f"          check  → only NEW violations; exit 2 feeds them back to the agent.\n"
+          f"          report → refreshes {report_out} each session "
+          f"(CPAU / savings / what-needs-you).")
     return 0
 
 # ---------------------------------------------------------------- allocate (R2)

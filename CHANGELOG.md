@@ -3,6 +3,25 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.20.0 — 2026-07-09
+- `install-hook` now installs **two** Stop hooks, not one: the existing
+  `check` (violations → self-repair) plus a new `report` hook that refreshes
+  a stable cumulative report at `<state-dir>/REPORT.md` after every session —
+  CPAU / savings / what-needs-you / pending tune proposals, at a fixed path,
+  with zero per-project wiring. Open one file to see the latest.
+  - Backward-compatible upgrade path: projects installed before 0.20 keep
+    their check hook and get the report hook **added** on the next
+    `install-hook` run (the check hook is never touched or duplicated).
+  - `|| true` on the report hook: a report failure can never block the
+    check hook's self-repair loop.
+  - Written inside the already-gitignored state dir → fresh each run, no
+    working-tree churn.
+  - Born from the air (ai-industry-research) flywheel: the auto-report was
+    first wired by hand at the *project* level (a Stop hook writing
+    `dev/STEWARD_REPORT.md`); generalised here to the *tool* so every
+    project that runs `install-hook` gets it. Shipped through the new
+    product-flywheel `S4_RELEASE_CHECKLIST.md`.
+
 ## 0.19.1 — 2026-07-08
 - Fix: `**` in every probe glob now means "zero or more directories" —
   `records/**/*.md` matches `records/a.md`. Raw fnmatch's behavior silently
