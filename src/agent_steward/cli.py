@@ -1086,10 +1086,50 @@ def run(manifest_path, root_override=None, out_override=None,
 
 # ---------------------------------------------------------------- stamp (R1)
 
+# Comment-leader per code-file extension. A bare `---` frontmatter block is a
+# SyntaxError in every one of these (2026-07-29 incident: a YAML block stamped
+# onto build_items.py killed the site-publish chain for a whole day). Files
+# whose format has no line comments (.json, .html, …) are refused outright —
+# provenance belongs in the ledger for those, not inside the file.
+COMMENT_LEADER = {
+    ".py": "# ", ".sh": "# ", ".bash": "# ", ".zsh": "# ", ".rb": "# ",
+    ".yaml": "# ", ".yml": "# ", ".toml": "# ", ".cfg": "# ", ".ini": "# ",
+    ".js": "// ", ".mjs": "// ", ".cjs": "// ", ".ts": "// ", ".tsx": "// ",
+    ".jsx": "// ",
+}
+FRONTMATTER_EXTS = {".md", ".markdown"}
+
+
+def _stamp_comment_style(text, fields, leader):
+    """Insert/update `<leader>key: value` provenance lines after any shebang /
+    encoding line, updating in place when the key already exists (idempotent
+    re-stamp). Returns new text."""
+    lines = text.split("\n")
+    head = 0
+    while head < len(lines) and (
+            lines[head].startswith("#!") or "coding:" in lines[head][:40]):
+        head += 1
+    pending = dict(fields)
+    for i in range(head, min(head + 20, len(lines))):
+        for k in list(pending):
+            if lines[i].startswith(leader.rstrip() + " " + k + ":") or \
+               lines[i].startswith(leader + k + ":"):
+                lines[i] = "{}{}: {}".format(leader, k, pending.pop(k))
+    if pending:
+        insert = ["{}{}: {}".format(leader, k, v) for k, v in pending.items()]
+        lines[head:head] = insert
+    return "\n".join(lines)
+
+
 def stamp_file(path, fields):
-    """Insert/update provenance keys in a file's frontmatter, preserving all
-    other lines verbatim (no YAML re-dump — comments and ordering survive).
-    Creates a frontmatter block if the file has none."""
+    """Insert/update provenance keys, format-aware:
+    - .md (or any file already carrying a frontmatter block): YAML frontmatter,
+      preserving all other lines verbatim (no YAML re-dump).
+    - code files (.py/.sh/.js/…): comment-style lines after the shebang —
+      NEVER a `---` block (it is a syntax error there).
+    - .py additionally gets a py_compile check; on failure the original text is
+      restored and an error is raised (a stamp must never break the file).
+    - formats with no line comments (.json/.html/unknown): refused."""
     with open(path, encoding="utf-8") as f:
         text = f.read()
 
@@ -1099,8 +1139,10 @@ def stamp_file(path, fields):
         s = str(v)
         return json.dumps(s) if re.search(r"[:#'\"{}\[\],&*?|>%@`]", s) or s != s.strip() else s
 
+    ext = os.path.splitext(path)[1].lower()
     m = FM_RE.match(text)
     if m:
+        # File already carries frontmatter — safe to keep using it whatever the ext.
         block_lines = m.group(1).split("\n")
         for k, v in fields.items():
             pat = re.compile(rf"^{re.escape(k)}\s*:")
@@ -1111,11 +1153,27 @@ def stamp_file(path, fields):
             else:
                 block_lines.append(f"{k}: {fmt(v)}")
         new_text = "---\n" + "\n".join(block_lines) + "\n---\n" + text[m.end():]
-    else:
+    elif ext in FRONTMATTER_EXTS:
         block = "\n".join(f"{k}: {fmt(v)}" for k, v in fields.items())
         new_text = f"---\n{block}\n---\n" + text
+    elif ext in COMMENT_LEADER:
+        new_text = _stamp_comment_style(text, {k: fmt(v) for k, v in fields.items()},
+                                        COMMENT_LEADER[ext])
+    else:
+        raise ValueError(
+            f"stamp: refusing {path!r} — no comment syntax known for {ext or 'no-ext'};"
+            " provenance for this file lives in the ledger (log-task), not in-file")
     with open(path, "w", encoding="utf-8") as f:
         f.write(new_text)
+    if ext == ".py":
+        import py_compile
+        try:
+            py_compile.compile(path, doraise=True)
+        except py_compile.PyCompileError as exc:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)  # restore — a stamp must never break the file
+            raise ValueError(f"stamp: {path} failed py_compile after stamping; "
+                             f"reverted. {exc.msg[:200]}") from exc
 
 
 def cmd_stamp(args):
@@ -1127,7 +1185,11 @@ def cmd_stamp(args):
         if not os.path.exists(path):
             print(f"[steward] stamp: no such file: {path}", file=sys.stderr)
             return 1
-        stamp_file(path, fields)
+        try:
+            stamp_file(path, fields)
+        except ValueError as exc:
+            print(f"[steward] {exc}", file=sys.stderr)
+            return 1
         print(f"[steward] stamped {path} "
               f"(produced_by={args.produced_by} task={args.task} round={args.round})")
     return 0
