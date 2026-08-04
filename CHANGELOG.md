@@ -3,6 +3,112 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.22.0 — 2026-08-04
+- Fix: **a clean probe and a probe that never ran looked identical in
+  `state.json`.** `violations` only ever got a key for a probe when it found
+  something, so any downstream script reading `violations['<probe-id>']` to
+  ask "is this clean?" got a `KeyError` instead of `[]` the moment a rule got
+  fixed to zero findings — the better the fix, the sooner it broke. Found via
+  a real case: a scope-guard manifest fix drove violations to 0, and the
+  acceptance check that read `violations['scope-guard']` blew up on the exact
+  run that proved the fix worked.
+- Added an opt-in manifest field, `always_report: true`, settable per probe.
+  A probe that declares it keeps its key in `violations` even at 0 findings
+  (as `[]`), so callers can distinguish "checked, nothing wrong" from "not
+  configured / didn't run". Probes that don't opt in keep the old behavior
+  unchanged — nothing downstream that already depends on "only list problems"
+  breaks. `always_report` is also now a recognized common probe key, so
+  `validate_manifest` doesn't flag it as unknown.
+- Lesson for the flywheel: don't fix this one script's `KeyError` — the same
+  shape of bug reappears for every future probe someone reads by key, unless
+  the engine itself can say "ran clean" instead of just "ran".
+
+## 0.21.0 — 2026-07-30
+- Fix: **CI was red on every run since 2026-07-23** and it was never the code.
+  Both workflows `pip install ruff` unpinned; ruff 0.16.0 (released 2026-07-23)
+  widened its default rule set, so `ruff check src/ tests/` started reporting
+  75 findings in files that had not changed. `pytest` was green throughout
+  (63 passed on 3.9 and 3.12) — the gate, not the engine, had drifted.
+- The lint contract now lives in `pyproject.toml` (`[tool.ruff.lint] select`)
+  instead of being inherited from whatever ruff version the runner installs
+  that day. Same rules the repo was written against (`E4`, `E7`, `E9`, `F`),
+  now reproducible across ruff versions; widening them is a deliberate commit.
+- Why not just adopt the new defaults: most of them contradict the trust
+  contract on purpose. `BLE001` (blind except), `PLW1510` (subprocess without
+  `check`) and `S112` are *how* "fail-open everywhere" is implemented — the
+  engine must never raise at a target — and `DTZ*` would force tz-aware
+  timestamps into a ledger whose history is naive-local. A gate that fights
+  the design is a broken gate.
+- Lesson for the flywheel: an unpinned tool in a gate is an unversioned
+  dependency on someone else's release schedule.
+- Fix: **state-dir discovery — a ledger fork was a silent loss of history.**
+  Every cwd-relative `.steward` lookup now walks up to the nearest existing
+  state dir (stopping at a `.git` boundary or `$HOME`) instead of creating a
+  fresh one wherever it happened to be invoked. Found by dogfooding: this
+  repo had grown a second ledger at `src/.steward/usage_ledger.jsonl` — two
+  entries, ~180k tokens — because a `log-task` ran one directory too deep.
+  Nothing errored; the spend just left the books, which is the one failure
+  mode an append-only ledger cannot self-correct. A sub-project with its own
+  `.steward/` still keeps its own books (nearest wins), and a nested repo can
+  no longer write into its parent's. `--state-dir` still wins outright.
+- Fix: **`scope_guard`'s built-in ignore list was root-anchored**, so it only
+  ever protected a *top-level* `node_modules/` or `__pycache__/`. Any project
+  with a sub-app (`pwa/node_modules/…`) got one "an agent created a file
+  nobody asked for" finding per vendored README — 140 of 241 open findings in
+  a real target, all of them npm's doing, none an agent's. Defaults are now
+  depth-agnostic (`**/node_modules/**`, plus `.venv`/`site-packages`) and the
+  walk no longer descends into them at all. A manifest-supplied `ignore:` is
+  still taken literally — only the built-in defaults were broadened. An
+  attention queue that cries wolf 140 times is not a queue.
+- Fix: a *negative* tuning effect no longer prints as "saved -297,576,026
+  (-47.0%)". Tuning is allowed to cost more — promotions buy quality — but
+  the line now says so: "costs 297,576,026 MORE (47.0%) — tuning bought
+  quality, not spend".
+
+### Real money (air/ACE dogfood)
+
+- **`cost_unit: usd_per_mtok`** — `cost_weights` can now be declared as US$ per
+  million tokens and the report prints real currency: `$872.68` instead of a
+  `931,057,246` index. Default is unchanged (unitless index), so existing
+  allocations read exactly as before. ACE plans to sell per-tenant cost
+  reporting; an index is not sellable.
+- **Cost follows the model, not the declaration.** An entry that records a
+  `model` is priced at the tier that model matches, not the tier the
+  dispatcher declared. In air's real ledger that is 849 of 1105 metered
+  entries — the old math priced 840 opus runs at the sonnet-shared `mid`
+  weight and understated them 2.5x.
+- **`tier_patterns_history`** — restructuring a tier table no longer rewrites
+  the past. Splitting opus out of `mid` into its own `high` tier would have
+  turned 849 of 1111 historical entries into "mis-logged" warnings, every one
+  of them correct under the table of its own day; mismatch checks now replay
+  the patterns in force at each entry's timestamp (the same principle
+  `_tier_at` already applied to provenance stamps). Pricing deliberately does
+  the opposite and always uses today's table — a compliance judgment belongs
+  to its day, a price is a fact about the world.
+- **Tuning effect counts only tasks tuning actually moved.** Tasks with no
+  history contributed a guaranteed-zero delta *and* dragged the baseline,
+  because the cold-start reconstruction falls back to today's tier. Result:
+  air's 3→4 tier restructure swung the reported tuning effect from -15.6% to
+  +18.8% with not one dispatch changed. A number that moves when nothing
+  happened is not a measurement. The line now names its scope
+  ("across N tuned task(s)").
+
+### Behaviour changes (no config edit required — read these)
+
+Both are default changes, which §2.A of the flywheel release checklist says to
+treat as breaking. Neither needs a migration step; both make a previously
+silent failure stop happening.
+
+1. State-dir lookup walks up (see above). If you *relied* on `log-task`
+   creating a fresh ledger in whatever directory you were standing in, pass
+   `--state-dir` explicitly.
+2. `scope_guard`'s built-in ignore list is depth-agnostic (see above). If you
+   genuinely want vendored trees audited, set an explicit `ignore:` — a
+   manifest-supplied list is still taken literally.
+
+Rollback: `pip install agent-steward==0.20.0`, or yank the release on PyPI.
+Nothing in this version writes a new on-disk format, so downgrading is safe.
+
 ## 0.20.0 — 2026-07-09
 - `install-hook` now installs **two** Stop hooks, not one: the existing
   `check` (violations → self-repair) plus a new `report` hook that refreshes

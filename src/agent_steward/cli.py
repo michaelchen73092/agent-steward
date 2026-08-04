@@ -58,6 +58,46 @@ except ImportError:  # running as a bare script without package context
 
 STATE_DIR_DEFAULT = ".steward"
 
+
+def find_state_dir(explicit=None, start=None):
+    """Resolve where state.json / usage_ledger.jsonl live.
+
+    An explicit --state-dir always wins. Otherwise walk up from `start`
+    (default: cwd) and use the NEAREST existing state dir, stopping after the
+    directory that holds `.git` (a repo boundary) or at $HOME / the filesystem
+    root. Only when none exists do we fall back to `<start>/.steward`.
+
+    Why this is not cosmetic: the ledger is history and the contract says
+    never rewrite it. Running `steward log-task` one directory too deep used
+    to silently start a SECOND ledger there — no error, no warning, just a
+    fork in the record, and that spend quietly left the books. Nearest
+    existing dir wins, so a sub-project with its own `.steward/` still keeps
+    its own books; the `.git` boundary stops a nested repo from writing into
+    its parent's ledger.
+
+    Fail-open: any OS error falls back to the old cwd-relative behaviour.
+    """
+    if explicit:
+        return os.path.abspath(explicit)
+    base = start or os.getcwd()
+    try:
+        cur = os.path.abspath(base)
+        home = os.path.abspath(os.path.expanduser("~"))
+        while True:
+            cand = os.path.join(cur, STATE_DIR_DEFAULT)
+            if os.path.isdir(cand):
+                return cand
+            if os.path.isdir(os.path.join(cur, ".git")) or cur == home:
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    except OSError:
+        pass
+    return os.path.abspath(os.path.join(base, STATE_DIR_DEFAULT))
+
+
 # ---------------------------------------------------------------- helpers
 
 def now_iso():
@@ -519,10 +559,25 @@ def probe_scope_guard(root, spec):
         return result(spec, "scope_guard", "skipped", "no expected globs configured")
     within = spec.get("within", "**/*")
     within = within if isinstance(within, list) else [within]
-    ignore = spec.get("ignore") or [".git/**", ".steward/**", ".claude/**",
-                                    "__pycache__/**", "node_modules/**"]
+    # Defaults are depth-agnostic on purpose: these directories are noise
+    # wherever they sit, and the old root-anchored forms ("node_modules/**")
+    # only ever protected a TOP-LEVEL one. A project with a sub-app
+    # (pwa/node_modules/, pipeline/__pycache__/) got every vendored README
+    # reported as agent over-delivery — 140 false findings in one real target,
+    # which is how a human attention queue dies. A manifest-supplied `ignore:`
+    # is still taken literally; only the built-in defaults are broadened.
+    ignore = spec.get("ignore") or ["**/.git/**", "**/.steward/**",
+                                    "**/.claude/**", "**/__pycache__/**",
+                                    "**/node_modules/**", "**/.venv/**",
+                                    "**/site-packages/**"]
     bad, n = [], 0
+    _prune = {".git", ".steward", ".claude", "__pycache__", "node_modules",
+              ".venv", "site-packages"}
     for dirpath, _dn, fns in os.walk(root):
+        # don't descend into vendored trees at all — walking a node_modules
+        # is minutes of I/O to produce findings we would discard anyway
+        if not spec.get("ignore"):
+            _dn[:] = [d for d in _dn if d not in _prune]
         for fn in fns:
             rel = os.path.relpath(os.path.join(dirpath, fn), root).replace(os.sep, "/")
             if not any(_glob_match(rel, g) for g in within):
@@ -876,7 +931,7 @@ def run(manifest_path, root_override=None, out_override=None,
     mode = mf.get("mode", "apply")  # apply | readonly
     project = mf.get("project", os.path.basename(root))
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    sdir = os.path.abspath(state_dir or os.path.join(os.getcwd(), STATE_DIR_DEFAULT))
+    sdir = find_state_dir(state_dir)
     # per-run artifacts live under the steward's own state dir — never inside
     # the installed package (site-packages is not a writable workspace)
     out_dir = os.path.abspath(out_override or os.path.join(sdir, "runs", f"{project}-{ts}"))
@@ -955,7 +1010,14 @@ def run(manifest_path, root_override=None, out_override=None,
     state = load_state(state_file)
     prev = (state.get("projects", {}).get(project, {})).get("violations", {})
     prev_ran_at = (state.get("projects", {}).get(project, {})).get("ran_at")
-    cur = {r["probe"]: r["violations"] for r in results if r["violations"]}
+    # a probe's key is normally only written when it has violations, so
+    # "clean" and "never configured/ran" look identical downstream. Probes
+    # that opt in via `always_report: true` keep their key even at 0
+    # violations (as []), so callers can tell the two apart.
+    always_report_ids = {str(s.get("id")) for s in mf.get("probes", []) or []
+                         if s.get("always_report")}
+    cur = {r["probe"]: r["violations"] for r in results
+           if r["violations"] or str(r["probe"]) in always_report_ids}
     new_v, resolved_v = diff_violations(prev, cur)
     if prev_ran_at:  # don't count the very first baseline as "fixes"
         record_fixes(sdir, project, resolved_v)
@@ -995,7 +1057,7 @@ def run(manifest_path, root_override=None, out_override=None,
 
     if savings:
         lines += ["", "## Spend (estimated savings so far)", ""]
-        lines += alloc_mod.spend_summary_lines(savings)
+        lines += alloc_mod.spend_summary_lines(savings, alloc=alloc)
         if savings["esc_rate"] is not None:
             lines.append(f"- trade-off: {savings['escalations']} escalations "
                          f"(rate {savings['esc_rate']}) — each cost one lower-tier redo")
@@ -1197,7 +1259,7 @@ def cmd_stamp(args):
 # ---------------------------------------------------------------- ledger (R1)
 
 def cmd_log_task(args):
-    sdir = os.path.abspath(args.state_dir or os.path.join(os.getcwd(), STATE_DIR_DEFAULT))
+    sdir = find_state_dir(args.state_dir)
     os.makedirs(sdir, exist_ok=True)
     entry = {"ts": now_iso(), "task": args.task, "tier": args.tier}
     for k in ("model", "est_tokens", "result", "project", "note",
@@ -1244,7 +1306,7 @@ def cmd_route(args):
     with open(args.manifest, encoding="utf-8") as f:
         mf = yaml.safe_load(f)
     project = args.project or mf.get("project")
-    sdir = os.path.abspath(args.state_dir or os.path.join(os.getcwd(), STATE_DIR_DEFAULT))
+    sdir = find_state_dir(args.state_dir)
     state = load_state(os.path.join(sdir, "state.json"))
     pstate = state.get("projects", {}).get(project)
     if not pstate:
@@ -1277,7 +1339,7 @@ def cmd_route(args):
 def cmd_approve(args):
     """Adjudicator feedback per queue item — the M4 calibration stream.
     The human's verdict is data about the SORTER, never about the artifact."""
-    sdir = os.path.abspath(args.state_dir or os.path.join(os.getcwd(), STATE_DIR_DEFAULT))
+    sdir = find_state_dir(args.state_dir)
     items = route_mod.load_queue(sdir)
     it = items.get(args.item)
     if not it:
@@ -1300,7 +1362,8 @@ def cmd_approve(args):
 # COMMON keys are legal on every probe.
 COMMON_PROBE_KEYS = {"id", "type", "severity", "on_fail", "source",
                      "source_file", "source_quote", "risk_weight", "route",
-                     "readonly_safe", "timeout", "fix", "fixable_by"}
+                     "readonly_safe", "timeout", "fix", "fixable_by",
+                     "always_report"}
 PROBE_PARAMS = {
     "cmd": ({"cmd"}, set()),
     "jsonl_wellformed": ({"path"}, set()),
@@ -1389,7 +1452,7 @@ def cmd_status():
                 print(f"    - {i}")
     else:
         print("manifest: none found here")
-    sdir = os.path.join(cwd, STATE_DIR_DEFAULT)
+    sdir = find_state_dir(None, cwd)
     state = load_state(os.path.join(sdir, "state.json"))
     projects = state.get("projects", {})
     for name, p in sorted(projects.items()):
@@ -1565,7 +1628,7 @@ def cmd_distill(args):
                           f"score 0.1 unless it carries genuinely new evidence.")
         printed += len(clusters)
     if args.queue or not args.path:
-        sdir = os.path.abspath(args.state_dir or os.path.join(os.getcwd(), STATE_DIR_DEFAULT))
+        sdir = find_state_dir(args.state_dir)
         noise, signal = route_mod.distill_queue(route_mod.load_queue(sdir))
         for b in noise:
             print(f"[steward] noisy rule '{b['probe']}': {b['n']} items judged "
@@ -1589,7 +1652,7 @@ def cmd_ingest_usage(args):
     Ingested entries carry via=transcript: money views count them; quality
     loops (tune/canary) keep requiring explicit verdicts. Incremental via a
     byte cursor; fail-open on anything unreadable."""
-    sdir = os.path.abspath(args.state_dir or os.path.join(os.getcwd(), STATE_DIR_DEFAULT))
+    sdir = find_state_dir(args.state_dir)
     if args.transcript:
         paths = [os.path.abspath(args.transcript)]
     else:
@@ -1659,7 +1722,7 @@ def cmd_canary(args):
     except yaml.YAMLError as e:
         print(f"[steward] canary: no — allocation unparsable ({str(e).splitlines()[0]})")
         return 1
-    sdir = os.path.abspath(args.state_dir or os.path.join(os.getcwd(), STATE_DIR_DEFAULT))
+    sdir = find_state_dir(args.state_dir)
     entries = alloc_mod.read_ledger(sdir, project=args.project)
     d = alloc_mod.canary_decision(alloc, entries, args.task)
     if d["run"]:
@@ -1788,7 +1851,7 @@ def cmd_allocate(args):
                   file=sys.stderr)
             return 1
         alloc = alloc_mod.load_allocation(path)
-        sdir = os.path.abspath(args.state_dir or os.path.join(os.getcwd(), STATE_DIR_DEFAULT))
+        sdir = find_state_dir(args.state_dir)
         entries = alloc_mod.read_ledger(sdir, project=args.project)
         if not entries:
             print(f"[steward] usage ledger empty ({sdir}/usage_ledger.jsonl) — "
@@ -1849,7 +1912,7 @@ def _parse_when_arg(value, name):
 def cmd_report(args):
     """Cumulative view: savings first, then trend, measured tuning effect,
     trade-offs, coverage, rule problems."""
-    sdir = os.path.abspath(args.state_dir or os.path.join(os.getcwd(), STATE_DIR_DEFAULT))
+    sdir = find_state_dir(args.state_dir)
     alloc = None
     apath = args.allocation or ".allocation.yaml"
     if os.path.exists(apath):
@@ -1946,7 +2009,7 @@ def cmd_report(args):
     lines += ["", "## Savings (estimated)", ""]
     if entries:
         lines += alloc_mod.spend_summary_lines(
-            sav, weights_note=f" (weights: {weights})")
+            sav, weights_note=f" (weights: {weights})", alloc=alloc)
         tier_order = (alloc or {}).get("tiers", alloc_mod.DEFAULT_TIERS)
         seen_tiers = [t for t in tier_order if t in sav["tokens_by_tier"]] + \
                      sorted(set(sav["tokens_by_tier"]) - set(tier_order))
@@ -1954,14 +2017,16 @@ def cmd_report(args):
             tot_tok = sum(sav["tokens_by_tier"].values()) or 1
             tot_cost = sum(sav["cost_by_tier"].values()) or 1
             lines += ["", "### Where the money goes (by tier)", "",
-                      "| tier | weight | runs | tokens | % volume | cost index | % cost |",
+                      f"| tier | weight | runs | tokens | % volume "
+                      f"| {alloc_mod.cost_label(alloc)} | % cost |",
                       "|---|---|---|---|---|---|---|"]
             for t in seen_tiers:
                 tok, cost = sav["tokens_by_tier"][t], sav["cost_by_tier"].get(t, 0)
                 lines.append(
                     f"| {t} | {weights.get(t, '?')} | {sav['entries_by_tier'].get(t, 0)} "
                     f"| {round(tok):,} | {round(100 * tok / tot_tok, 1)}% "
-                    f"| {round(cost):,} | {round(100 * cost / tot_cost, 1)}% |")
+                    f"| {alloc_mod.money(alloc, cost)} "
+                    f"| {round(100 * cost / tot_cost, 1)}% |")
     else:
         lines.append("(usage ledger is empty — savings appear once tasks are "
                      "logged with `steward log-task`)")
@@ -2014,9 +2079,11 @@ def cmd_report(args):
         cpau = alloc_mod.cpau_by_task(entries, alloc)
         if cpau:
             lines += ["", "## CPAU (cost per accepted unit — the north star)", "",
-                      "| task | runs | accepted | CPAU |", "|---|---|---|---|"]
+                      f"| task | runs | accepted | {alloc_mod.cost_label(alloc, 'CPAU')} |",
+                      "|---|---|---|---|"]
             for tid, a in sorted(cpau.items()):
-                c = f"{a['cpau']:,}" if a["cpau"] is not None else "-"
+                c = (alloc_mod.money(alloc, a["cpau"])
+                     if a["cpau"] is not None else "-")
                 lines.append(f"| {tid} | {a['runs']} | {a['accepted']} | {c} |")
             lines.append("\n(cost of every primary run, failures included, "
                          "divided by accepted runs — waste is part of the price)")
@@ -2185,7 +2252,8 @@ def main():
                         help="with --diff: exit 2 and print new violations to "
                              "stderr (hook contract)")
         cp.add_argument("--state-dir",
-                        help=f"where state.json lives (default: ./{STATE_DIR_DEFAULT})")
+                        help=f"where state.json lives (default: nearest {STATE_DIR_DEFAULT}/ "
+                             f"walking up from cwd, else ./{STATE_DIR_DEFAULT})")
 
     sp = sub.add_parser("stamp", help="write provenance frontmatter into artifact(s)")
     sp.add_argument("files", nargs="+")
@@ -2210,7 +2278,8 @@ def main():
                     help="allocation file used to warn on tier/model mismatch "
                          "(default: ./.allocation.yaml if present)")
     lp.add_argument("--state-dir",
-                    help=f"where usage_ledger.jsonl lives (default: ./{STATE_DIR_DEFAULT})")
+                    help=f"where usage_ledger.jsonl lives (default: nearest "
+                         f"{STATE_DIR_DEFAULT}/ walking up from cwd, else ./{STATE_DIR_DEFAULT})")
 
     alp = sub.add_parser("allocate",
                          help="tier table lifecycle: rubric -> init (auto cold start) -> tune")

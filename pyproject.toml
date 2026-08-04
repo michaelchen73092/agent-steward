@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-steward"
-version = "0.20.0"
+version = "0.22.0"
 description = "A quality gate and spend auditor for your AI agent fleet."
 readme = "README.md"
 license = { text = "MIT" }
@@ -30,3 +30,19 @@ Changelog = "https://github.com/michaelchen73092/agent-steward/blob/main/CHANGEL
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_steward"]
+
+[tool.ruff]
+# The lint contract is pinned HERE, not inherited from whatever ruff version CI
+# happens to install. ruff 0.16.0 (2026-07-23) widened its default rule set;
+# CI installs ruff unpinned, so every run from that date on failed with 75
+# findings in code that had not changed. Most of the newly-default rules
+# contradict this engine's trust contract on purpose — BLE001 (blind except),
+# PLW1510 (subprocess without check) and S112 are how "fail-open everywhere"
+# is implemented, and DTZ* would force tz-aware stamps into a ledger whose
+# history is naive-local. Declaring `select` makes the gate reproducible across
+# ruff versions; widening it becomes a deliberate commit, never a silent
+# upgrade that turns CI red overnight.
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]  # ruff's historical default set — the contract this repo was written against

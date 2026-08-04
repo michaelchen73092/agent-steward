@@ -220,6 +220,33 @@ def test_diff_new_then_resolved(tmp_path):
     assert st["projects"]["fixture-project"]["violations"] == {}
 
 
+def test_always_report_distinguishes_clean_from_never_ran(tmp_path):
+    # a probe declaring `always_report: true` must leave a [] key in
+    # `violations` when it's clean, so downstream readers can tell "checked,
+    # 0 violations" apart from "never configured/ran" (both used to be a
+    # missing key — see T-20260804-27). Probes that don't opt in keep the
+    # old behavior: clean means the key is absent entirely.
+    proj = tmp_path / "proj"
+    write(proj, "facts/2026/ok.md", FACT_OK)
+    manifest = make_manifest(tmp_path, proj, extra={"probes": [
+        {"id": "fact-schema", "type": "frontmatter_required",
+         "glob": "facts/**/*.md", "required": ["id", "confidence"],
+         "severity": "warn", "source": "RULES.md §1", "always_report": True},
+        {"id": "other-schema", "type": "frontmatter_required",
+         "glob": "facts/**/*.md", "required": ["id", "confidence"],
+         "severity": "warn", "source": "RULES.md §1"},
+    ]})
+    run_check(manifest, tmp_path / "o", tmp_path / "state")
+
+    st = json.load(open(tmp_path / "state" / "state.json"))
+    violations = st["projects"]["fixture-project"]["violations"]
+    assert violations["fact-schema"] == []          # opted in, clean -> present as []
+    assert "other-schema" not in violations         # not opted in -> old behavior
+
+    problems = cli.validate_manifest(yaml.safe_load(open(manifest)))
+    assert not any("always_report" in p for p in problems)  # not flagged as unknown
+
+
 def test_source_column_in_report(tmp_path):
     proj = tmp_path / "proj"
     write(proj, "facts/2026/ok.md", FACT_OK)
@@ -1283,3 +1310,201 @@ def test_report_cli_trend_and_since(tmp_path):
     assert "## Trend" not in r2.stdout          # single period -> no trend table
     r3 = steward_cli("report", "--state-dir", str(sdir), "--since", "not-a-date")
     assert r3.returncode == 1 and "cannot parse" in r3.stderr
+
+
+# ---- state-dir discovery: a ledger fork is a silent loss of history --------
+# Evidence that motivated this: agent-steward's own repo grew a second ledger
+# at src/.steward/usage_ledger.jsonl (2 entries, 180k tokens) because a
+# `log-task` ran one directory too deep. No error was raised — the spend just
+# left the books.
+
+def test_find_state_dir_walks_up_to_nearest_existing(tmp_path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".steward").mkdir()
+    deep = tmp_path / "src" / "pkg"
+    deep.mkdir(parents=True)
+    assert cli.find_state_dir(None, str(deep)) == str(tmp_path / ".steward")
+
+
+def test_find_state_dir_explicit_wins(tmp_path):
+    (tmp_path / ".steward").mkdir()
+    explicit = tmp_path / "elsewhere"
+    assert cli.find_state_dir(str(explicit), str(tmp_path)) == str(explicit)
+
+
+def test_find_state_dir_nearest_beats_ancestor(tmp_path):
+    """A sub-project with its own books keeps them."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".steward").mkdir()
+    sub = tmp_path / "newsletters"
+    (sub / ".steward").mkdir(parents=True)
+    inner = sub / "outbox"
+    inner.mkdir()
+    assert cli.find_state_dir(None, str(inner)) == str(sub / ".steward")
+
+
+def test_find_state_dir_stops_at_git_boundary(tmp_path):
+    """A nested repo must not write into its parent's ledger."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".steward").mkdir()
+    nested = tmp_path / "vendor" / "other-repo"
+    (nested / ".git").mkdir(parents=True)
+    work = nested / "src"
+    work.mkdir()
+    assert cli.find_state_dir(None, str(work)) == str(work / ".steward")
+
+
+def test_find_state_dir_falls_back_to_cwd_when_none_exists(tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert cli.find_state_dir(None, str(tmp_path)) == str(tmp_path / ".steward")
+
+
+def test_log_task_from_subdir_appends_to_the_repo_ledger(tmp_path):
+    """End-to-end: the regression that orphaned real spend."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".steward").mkdir()
+    sub = tmp_path / "src"
+    sub.mkdir()
+    r = subprocess.run(
+        [sys.executable, os.path.join(os.path.dirname(__file__), "..", "src",
+                                      "agent_steward", "cli.py"),
+         "log-task", "--task", "t1", "--tier", "mid", "--model", "claude-x",
+         "--est-tokens", "100"],
+        cwd=str(sub), capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert not (sub / ".steward").exists(), "log-task forked a second ledger"
+    lines = (tmp_path / ".steward" / "usage_ledger.jsonl").read_text().strip().splitlines()
+    assert json.loads(lines[-1])["task"] == "t1"
+
+
+def test_scope_guard_ignores_vendored_trees_at_any_depth(tmp_path):
+    """Regression: the built-in ignore list was root-anchored, so a sub-app's
+    node_modules/ produced one 'agent over-delivery' finding per vendored
+    README — 140 of 241 open findings in a real target."""
+    root = tmp_path / "proj"
+    write(root, "docs/real.md", "kept")
+    write(root, "pwa/node_modules/left-pad/README.md", "vendored")
+    write(root, "pwa/node_modules/x/nested/node_modules/y/readme.md", "vendored")
+    write(root, "pipeline/__pycache__/notes.md", "cache")
+    write(root, "stray.md", "genuinely out of scope")
+    spec = {"id": "sg", "type": "scope_guard", "within": "**/*.md",
+            "expected": ["docs/**"]}
+    r = cli.probe_scope_guard(str(root), spec)
+    assert r["violations"] == [
+        v for v in r["violations"] if v.startswith("stray.md")], r["violations"]
+    assert len(r["violations"]) == 1
+
+
+def test_scope_guard_explicit_ignore_is_taken_literally(tmp_path):
+    """A manifest-supplied ignore: means exactly what it says — broadening the
+    defaults must not start rewriting the human's globs."""
+    root = tmp_path / "proj"
+    write(root, "docs/real.md", "kept")
+    write(root, "pwa/node_modules/left-pad/README.md", "vendored")
+    spec = {"id": "sg", "type": "scope_guard", "within": "**/*.md",
+            "expected": ["docs/**"], "ignore": ["nothing-matches/**"]}
+    r = cli.probe_scope_guard(str(root), spec)
+    assert any("node_modules" in v for v in r["violations"])
+
+
+def test_savings_line_names_a_negative_tuning_effect_honestly():
+    from agent_steward import allocate as alloc_mod
+    sav = {"metered": 3, "actual_cost": 300.0, "top_cost": 500.0,
+           "saved_vs_top": 200.0, "saved_vs_top_pct": 40.0,
+           "initial_cost": 200.0, "saved_vs_initial": -100.0,
+           "saved_vs_initial_pct": -50.0, "no_tokens": 0, "unknown_tier": 0,
+           "tokens_by_tier": {}, "entries_by_tier": {}, "cost_by_tier": {},
+           "canary_runs": 0, "canary_cost": 0.0}
+    line = [x for x in alloc_mod.spend_summary_lines(sav) if "cold-start" in x][0]
+    assert "costs 100 MORE (50.0%)" in line
+    assert "saved -" not in line
+
+
+# ---- real money: price from the model, judge compliance by its own day -----
+
+OLD_PATS = {"cheap": ["*haiku*"], "mid": ["*sonnet*", "*opus*"],
+            "top": ["*fable*"]}
+NEW_ALLOC = {
+    "tiers": ["cheap", "mid", "high", "top"],
+    "cost_weights": {"cheap": 1.8, "mid": 3.6, "high": 9.0, "top": 18.0},
+    "cost_unit": "usd_per_mtok",
+    "tier_patterns": {"cheap": ["*haiku*"], "mid": ["*sonnet*"],
+                      "high": ["*opus*"], "top": ["*fable*"]},
+    "tier_patterns_history": [{"at": "2026-07-30T21:00:00",
+                               "patterns": OLD_PATS, "reason": "split opus out"}],
+}
+
+
+def test_patterns_at_replays_the_table_of_the_day():
+    from agent_steward import allocate as a
+    assert a.patterns_at(NEW_ALLOC, "2026-07-15T00:00:00") == OLD_PATS
+    assert a.patterns_at(NEW_ALLOC, "2026-08-01T00:00:00")["high"] == ["*opus*"]
+    assert a.patterns_at(NEW_ALLOC, None) == NEW_ALLOC["tier_patterns"]
+    assert a.patterns_at({"tier_patterns": OLD_PATS}, "2026-01-01") == OLD_PATS
+
+
+def test_restructuring_the_table_does_not_rewrite_the_past():
+    """849 of 1111 real entries would have flipped to 'mis-logged' overnight."""
+    from agent_steward import allocate as a
+    old = [{"ts": "2026-07-15T00:00:00", "task": "t", "tier": "mid",
+            "model": "claude-opus-4-8", "est_tokens": 1000}]
+    new = [{"ts": "2026-08-05T00:00:00", "task": "t", "tier": "mid",
+            "model": "claude-opus-4-8", "est_tokens": 1000}]
+    assert a.ledger_mismatches(NEW_ALLOC, old) == ([], [])
+    mism, _ = a.ledger_mismatches(NEW_ALLOC, new)
+    assert len(mism) == 1 and mism[0]["matches_tiers"] == ["high"]
+
+
+def test_cost_follows_the_model_not_the_declaration():
+    from agent_steward import allocate as a
+    e = [{"ts": "2026-08-05T00:00:00", "task": "t", "tier": "mid",
+          "model": "claude-opus-4-8", "est_tokens": 1_000_000}]
+    sav = a.compute_savings(e, NEW_ALLOC)
+    assert sav["actual_cost"] == 9_000_000    # priced as high (opus), not mid
+    assert sav["declared_cost"] == 0          # task has no tune history
+    assert sav["priced_by_model"] == 1
+    assert sav["tokens_by_tier"] == {"high": 1_000_000}
+
+
+def test_price_tier_falls_back_when_the_model_says_nothing():
+    from agent_steward import allocate as a
+    assert a.price_tier(NEW_ALLOC, {"tier": "mid"}) == ("mid", False)
+    assert a.price_tier(NEW_ALLOC, {"tier": "mid", "model": "gpt-9"}) == ("mid", False)
+    amb = {"tier_patterns": {"mid": ["*sonnet*"], "high": ["*opus*"]}}
+    assert a.price_tier(amb, {"tier": "high",
+                              "model": "sonnet-alias-opus"})[0] == "high"
+
+
+def test_money_prints_dollars_only_when_the_unit_says_so():
+    from agent_steward import allocate as a
+    assert a.money(NEW_ALLOC, 931_057_246) == "$931.06"
+    assert a.money(NEW_ALLOC, 2_589_198_700) == "$2,589"
+    assert a.money(NEW_ALLOC, 1_500_000) == "$1.50"
+    assert a.money({}, 931_057_246) == "931,057,246"
+    assert a.cost_label(NEW_ALLOC) == "cost (USD)"
+    assert a.cost_label({}) == "cost index"
+
+
+def test_tuning_effect_only_counts_tasks_tuning_actually_moved(tmp_path):
+    """Relabelling a tier for unrelated reasons must not move this number.
+    Real case: the 3->4 tier restructure swung it from -15.6% to +18.8%
+    without a single dispatch changing."""
+    from agent_steward import allocate as a
+    alloc = dict(NEW_ALLOC)
+    alloc = {**alloc,
+             "tasks": [{"id": "tuned", "tier": "high"}, {"id": "never", "tier": "high"}],
+             "history": [{"at": "2026-07-01", "task": "tuned",
+                          "from": "mid", "to": "high", "reason": "x"}]}
+    e = [{"ts": "2026-08-05", "task": "tuned", "tier": "high",
+          "model": "claude-opus-4-8", "est_tokens": 1_000_000},
+         {"ts": "2026-08-05", "task": "never", "tier": "high",
+          "model": "claude-opus-4-8", "est_tokens": 5_000_000}]
+    sav = a.compute_savings(e, alloc)
+    assert sav["tuned_tasks"] == 1
+    # only the tuned task feeds the comparison: 1M @ mid(3.6) vs 1M @ high(9)
+    assert sav["initial_cost"] == 3_600_000
+    assert sav["declared_cost"] == 9_000_000
+    # ...while the untuned 5M tokens still count in real spend
+    assert sav["actual_cost"] == 54_000_000
+    assert ", across 1 tuned task(s)" in \
+        [x for x in a.spend_summary_lines(sav, alloc=alloc) if "cold-start" in x][0]
