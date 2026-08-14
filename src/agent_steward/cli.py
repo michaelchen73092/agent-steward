@@ -1238,6 +1238,17 @@ def stamp_file(path, fields):
                              f"reverted. {exc.msg[:200]}") from exc
 
 
+def _is_judgment_memory_path(path):
+    """repo `memory/` (the cross-account judgment-memory SSoT, symlinked into
+    every account's project dir) is not a pipeline artifact — it is authored
+    prose, not something a production task "produced". A 2026-08-03 stamp
+    onto memory/MEMORY.md broke its header (frontmatter where readers expect
+    `# Memory Index` as line 1); this guard makes that class of mistake
+    impossible instead of relying on callers to remember to exclude it."""
+    parts = os.path.normpath(os.path.abspath(path)).split(os.sep)
+    return "memory" in parts
+
+
 def cmd_stamp(args):
     fields = {"produced_by": args.produced_by, "task": args.task}
     if args.round is not None:
@@ -1246,6 +1257,11 @@ def cmd_stamp(args):
     for path in args.files:
         if not os.path.exists(path):
             print(f"[steward] stamp: no such file: {path}", file=sys.stderr)
+            return 1
+        if _is_judgment_memory_path(path):
+            print(f"[steward] stamp: refused — {path!r} is under a memory/ "
+                  "directory (judgment-memory SSoT, not a pipeline artifact); "
+                  "provenance stamps do not apply here", file=sys.stderr)
             return 1
         try:
             stamp_file(path, fields)
