@@ -529,6 +529,29 @@ def test_log_task_appends_jsonl(tmp_path):
     assert entry["est_tokens"] == 1200 and entry["result"] == "pass" and entry["ts"]
 
 
+def test_log_task_person_id_written_and_omitted(tmp_path):
+    """T-20260814-120 正反案 — `--person` is the identity write-end.
+
+    正案: given, the row carries `person_id` so spend can be grouped by人.
+    反案: omitted, the key is *absent* (not "" / not "unknown") — an
+    un-attributed row must stay visibly un-attributed, otherwise a per-person
+    reading silently invents a bucket (rule 7: declaring is not measuring).
+    """
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    base = [sys.executable, "-m", "agent_steward.cli", "log-task",
+            "--task", "extract", "--tier", "mid", "--model", "claude-opus-4-8",
+            "--est-tokens", "1200", "--result", "pass",
+            "--state-dir", str(tmp_path / ".steward")]
+    r = subprocess.run(base + ["--person", "owner"], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    r = subprocess.run(base, capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    rows = [json.loads(x) for x in
+            open(tmp_path / ".steward" / "usage_ledger.jsonl").read().splitlines()]
+    assert rows[0]["person_id"] == "owner"          # 正案
+    assert "person_id" not in rows[1]               # 反案:缺 = 缺,不是空字串
+
+
 def test_log_task_warns_on_tier_model_mismatch(tmp_path):
     """Observe-only: a tier/model contradiction warns on stderr but the entry
     is still appended (append-only ledger, exit 0)."""

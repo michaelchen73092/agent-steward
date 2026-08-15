@@ -1275,11 +1275,21 @@ def cmd_stamp(args):
 # ---------------------------------------------------------------- ledger (R1)
 
 def cmd_log_task(args):
+    """Append one task to the usage ledger.
+
+    `person_id` (via `--person`, T-20260814-120) is the *dispatcher-declared*
+    identity that this token spend belongs to — same rule as `--model`
+    (metering law ①: the dispatcher declares, the worker never self-reports).
+    It is optional and unvalidated here on purpose: this CLI is project-
+    agnostic and must not import a consumer's roster. The caller resolves the
+    id (in AIR: `project_accounts.seat_holder(seat, project_id)`); rows written
+    without it stay honestly un-attributed rather than guessed at.
+    """
     sdir = find_state_dir(args.state_dir)
     os.makedirs(sdir, exist_ok=True)
     entry = {"ts": now_iso(), "task": args.task, "tier": args.tier}
     for k in ("model", "est_tokens", "result", "project", "note",
-              "canary", "pair", "quality"):
+              "person_id", "canary", "pair", "quality"):
         v = getattr(args, k.replace("-", "_"), None)
         if v is not None:
             entry[k] = v
@@ -2285,6 +2295,10 @@ def main():
     lp.add_argument("--result", help="outcome (e.g. pass/fail/escalated)")
     lp.add_argument("--project")
     lp.add_argument("--note")
+    lp.add_argument("--person", dest="person_id",
+                    help="person this spend is attributed to (dispatcher-"
+                         "declared id, never worker self-reported); omit to "
+                         "leave the row honestly un-attributed")
     lp.add_argument("--canary", choices=["primary", "shadow"],
                     help="mark this entry as one half of a canary pair (R3)")
     lp.add_argument("--pair", help="canary pair id linking primary and shadow")
