@@ -3,6 +3,25 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.24.0 — 2026-08-21
+- Fix: **`state.json`'s read-diff-write had no lock.** Every `steward check
+  --diff` process — one per session's Stop hook, and this project routinely
+  runs several sessions concurrently — reads `state.json`, diffs against it,
+  and writes a new snapshot back, unguarded. Two processes racing that
+  window let the later writer silently rewind the earlier writer's snapshot,
+  so the next run diffs against a stale `violations` map and re-reports an
+  already-seen, fingerprint-matched violation as new. Added `locked_state()`
+  (an `fcntl.flock` exclusive lock scoped to the read-diff-write only, not
+  the probe run itself) around the one call site in `run()`.
+- Note for anyone chasing a similar false-new report: check the *deployed*
+  copy first. This exact fix sat correct and tested in source for two hours
+  before it deployed, because `steward` on this box runs from a site-packages
+  install (non-editable) that only picks up source changes on `pip install
+  --user .` — see T-20260821-54's return note and the earlier T-20260814-120
+  precedent it names. If the deployed `cli.py` doesn't `grep -c locked_state`
+  greater than zero, the fix hasn't shipped yet regardless of what source
+  says.
+
 ## 0.22.0 — 2026-08-04
 - Fix: **a clean probe and a probe that never ran looked identical in
   `state.json`.** `violations` only ever got a key for a probe when it found

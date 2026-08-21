@@ -296,6 +296,66 @@ def test_diff_survives_growing_file_line_shift_end_to_end(tmp_path):
     assert "a second, distinct issue" in new_section3
 
 
+def test_locked_state_serializes_concurrent_readers_writers(tmp_path):
+    # T-20260821-54: the real bug wasn't _violation_fingerprint (that's
+    # already correct and covered above) — it was that state.json's
+    # read-diff-write in run() had no locking, and this file is hit by many
+    # concurrent `steward check` processes (one per session's Stop hook,
+    # see .claude/settings.json). Two processes can both read the same
+    # prev snapshot before either writes; whichever writes last silently
+    # discards the other's update (a classic lost-update race). This test
+    # exercises the fix (locked_state()) directly with a plain
+    # read-increment-write counter — without the lock this reliably loses
+    # updates under thread interleaving; with it, none are lost.
+    import threading
+    import time
+
+    from agent_steward import cli
+
+    state_file = str(tmp_path / "state.json")
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump({"counter": 0}, f)
+
+    iterations, n_threads = 25, 4
+
+    def worker():
+        for _ in range(iterations):
+            with cli.locked_state(state_file):
+                state = cli.load_state(state_file)
+                state["counter"] = state.get("counter", 0) + 1
+                time.sleep(0.001)  # widen the race window
+                with open(state_file, "w", encoding="utf-8") as f:
+                    json.dump(state, f)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    final = cli.load_state(state_file)
+    assert final["counter"] == iterations * n_threads
+
+
+def test_diff_violations_real_20260821_snapshots_stay_stable():
+    # T-20260821-54: replay of the actual production snapshots that
+    # triggered the false "new" report three times in one day (09:25 /
+    # 09:47 / 10:06, pipeline/pwa_writeback_poller.py, same 39-守門b
+    # comment line). Confirms diff_violations()/_violation_fingerprint()
+    # were never the problem: fed the real consecutive snapshots directly
+    # (bypassing the state.json race that actually caused the false
+    # report), the diff is empty across every transition — the fix
+    # belongs in the read-diff-write locking (see
+    # test_locked_state_serializes_concurrent_readers_writers), not here.
+    v_092501 = "15833 |     # (39-守門b) 環境包白名單逐字鏡像(雲端抄的那份 == 這裡這份)。雲端比這裡鬆 ="
+    v_094736 = "15936 |     # (39-守門b) 環境包白名單逐字鏡像(雲端抄的那份 == 這裡這份)。雲端比這裡鬆 ="
+    v_100639 = "15955 |     # (39-守門b) 環境包白名單逐字鏡像(雲端抄的那份 == 這裡這份)。雲端比這裡鬆 ="
+    for prev_v, cur_v in ((v_092501, v_094736), (v_094736, v_100639)):
+        new, resolved = cli.diff_violations({"py-lint": [prev_v]}, {"py-lint": [cur_v]})
+        assert new == {}, new
+        assert resolved == {}, resolved
+
+
 def test_always_report_distinguishes_clean_from_never_ran(tmp_path):
     # a probe declaring `always_report: true` must leave a [] key in
     # `violations` when it's clean, so downstream readers can tell "checked,

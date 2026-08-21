@@ -30,8 +30,10 @@ Usage:
   steward log-task --task TASK_ID --tier TIER [--model M] [--est-tokens N] [--result R]
 """
 import argparse
+import contextlib
 import csv as csvmod
 import datetime as dt
+import fcntl
 import fnmatch
 import io
 import json
@@ -853,6 +855,29 @@ def load_state(state_file):
         return {}
 
 
+@contextlib.contextmanager
+def locked_state(state_file):
+    """Serialize the read-diff-write of state.json across concurrent
+    `steward check` processes (e.g. many parallel sessions' Stop hooks
+    firing within seconds of each other). Without this, two processes can
+    both read the same prev snapshot, and whichever writes last clobbers
+    the other's update — rewinding state.json to an older `violations`
+    map. The next run then diffs against that stale snapshot and reports
+    an already-seen (fingerprint-matched) violation as new again, even
+    though diff_violations() itself is correct (T-20260821-54: traced a
+    same-day triple false-new report to this race, not to the fingerprint
+    regex — T-20260820-131 already fixed and locked down the fingerprint
+    side with its own tests).
+    """
+    lock_path = state_file + ".lock"
+    with open(lock_path, "a") as lockf:
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+
+
 def check_source_quotes(mf, root):
     """Anti-transcription-error mechanism: a probe that encodes numbers copied
     from an authoritative doc can carry `source_file` (path under root) and
@@ -1043,39 +1068,43 @@ def run(manifest_path, root_override=None, out_override=None,
     ledger = alloc_mod.read_ledger(sdir, project=project)
     savings = alloc_mod.compute_savings(ledger, alloc) if ledger else None
 
-    # diff vs last check (state lives OUTSIDE the target — zero-pollution)
+    # diff vs last check (state lives OUTSIDE the target — zero-pollution).
+    # Locked end-to-end: many concurrent `steward check` processes (one per
+    # session's Stop hook) can read+write this same file within seconds of
+    # each other, and an unlocked read-diff-write races (see locked_state()).
     state_file = os.path.join(sdir, "state.json")
-    state = load_state(state_file)
-    prev = (state.get("projects", {}).get(project, {})).get("violations", {})
-    prev_ran_at = (state.get("projects", {}).get(project, {})).get("ran_at")
-    # a probe's key is normally only written when it has violations, so
-    # "clean" and "never configured/ran" look identical downstream. Probes
-    # that opt in via `always_report: true` keep their key even at 0
-    # violations (as []), so callers can tell the two apart.
-    always_report_ids = {str(s.get("id")) for s in mf.get("probes", []) or []
-                         if s.get("always_report")}
-    cur = {r["probe"]: r["violations"] for r in results
-           if r["violations"] or str(r["probe"]) in always_report_ids}
-    new_v, resolved_v = diff_violations(prev, cur)
-    if prev_ran_at:  # don't count the very first baseline as "fixes"
-        record_fixes(sdir, project, resolved_v)
-    probe_meta = {str(s.get("id")): s for s in mf.get("probes", []) or []}
-    state.setdefault("projects", {})[project] = {
-        "ran_at": now_iso(), "root": root, "violations": cur,
-        "metrics": metrics, "conflicts": conflicts,
-        "coverage": ({k: coverage[k] for k in ("uncovered", "drift")} if coverage else None),
-        # per-probe stats + fix guidance so the report can render the
-        # "authorize fixes per category" view without re-reading the manifest
-        "probe_stats": [{
-            "probe": r["probe"], "type": r["type"], "status": r["status"],
-            "n_violations": r["n_violations"], "n_checked": r["n_checked"],
-            "fix": str(probe_meta.get(r["probe"], {}).get("fix", "")),
-            "fixable_by": str(probe_meta.get(r["probe"], {}).get("fixable_by", "")),
-            "source": r.get("source", ""),
-        } for r in results],
-    }
-    with open(state_file, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=1)
+    with locked_state(state_file):
+        state = load_state(state_file)
+        prev = (state.get("projects", {}).get(project, {})).get("violations", {})
+        prev_ran_at = (state.get("projects", {}).get(project, {})).get("ran_at")
+        # a probe's key is normally only written when it has violations, so
+        # "clean" and "never configured/ran" look identical downstream. Probes
+        # that opt in via `always_report: true` keep their key even at 0
+        # violations (as []), so callers can tell the two apart.
+        always_report_ids = {str(s.get("id")) for s in mf.get("probes", []) or []
+                             if s.get("always_report")}
+        cur = {r["probe"]: r["violations"] for r in results
+               if r["violations"] or str(r["probe"]) in always_report_ids}
+        new_v, resolved_v = diff_violations(prev, cur)
+        if prev_ran_at:  # don't count the very first baseline as "fixes"
+            record_fixes(sdir, project, resolved_v)
+        probe_meta = {str(s.get("id")): s for s in mf.get("probes", []) or []}
+        state.setdefault("projects", {})[project] = {
+            "ran_at": now_iso(), "root": root, "violations": cur,
+            "metrics": metrics, "conflicts": conflicts,
+            "coverage": ({k: coverage[k] for k in ("uncovered", "drift")} if coverage else None),
+            # per-probe stats + fix guidance so the report can render the
+            # "authorize fixes per category" view without re-reading the manifest
+            "probe_stats": [{
+                "probe": r["probe"], "type": r["type"], "status": r["status"],
+                "n_violations": r["n_violations"], "n_checked": r["n_checked"],
+                "fix": str(probe_meta.get(r["probe"], {}).get("fix", "")),
+                "fixable_by": str(probe_meta.get(r["probe"], {}).get("fixable_by", "")),
+                "source": r.get("source", ""),
+            } for r in results],
+        }
+        with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=1)
 
     # persist
     with open(os.path.join(out_dir, "probe_results.jsonl"), "w", encoding="utf-8") as f:
