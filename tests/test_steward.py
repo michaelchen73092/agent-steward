@@ -220,6 +220,82 @@ def test_diff_new_then_resolved(tmp_path):
     assert st["projects"]["fixture-project"]["violations"] == {}
 
 
+def test_diff_violations_ignores_line_number_shift():
+    # real-world shape (T-20260820-131): the same ruff context-frame line for
+    # probe py-lint reported three times in one session, purely because the
+    # target file grew above the flagged spot (14380 -> 14443 -> 14496) —
+    # unchanged content, shifted position. Must not read as new+resolved.
+    v14380 = "14380 |     # (39-守門b) 環境包白名單逐字鏡像(雲端抄的那份 == 這裡這份)"
+    v14443 = "14443 |     # (39-守門b) 環境包白名單逐字鏡像(雲端抄的那份 == 這裡這份)"
+    v14496 = "14496 |     # (39-守門b) 環境包白名單逐字鏡像(雲端抄的那份 == 這裡這份)"
+    for prev_v, cur_v in ((v14380, v14443), (v14443, v14496)):
+        new, resolved = cli.diff_violations({"py-lint": [prev_v]}, {"py-lint": [cur_v]})
+        assert new == {}, new
+        assert resolved == {}, resolved
+
+    # ruff's `file:line:col:` header form shifts the same way — also stable
+    h1 = "pkg/mod.py:14381:5: F841 local variable `x` assigned but never used"
+    h2 = "pkg/mod.py:14444:5: F841 local variable `x` assigned but never used"
+    new, resolved = cli.diff_violations({"py-lint": [h1]}, {"py-lint": [h2]})
+    assert new == {} and resolved == {}
+
+
+def test_diff_violations_still_catches_real_new_and_resolved():
+    stale = "14380 |     # comment A — original finding"
+    fresh = "9999 |     # comment B — a genuinely different finding"
+    new, resolved = cli.diff_violations({"py-lint": [stale]}, {"py-lint": [fresh]})
+    assert new == {"py-lint": [fresh]}
+    assert resolved == {"py-lint": [stale]}
+
+
+def test_diff_violations_counts_duplicate_fingerprints_by_multiset():
+    # two identical-content violations at different line positions growing to
+    # three occurrences: exactly one new (the extra occurrence), not zero
+    # (fingerprint collapsed into a set) and not three (raw text compared).
+    prev = {"py-lint": ["10 | dup", "20 | dup"]}
+    cur = {"py-lint": ["11 | dup", "21 | dup", "31 | dup"]}
+    new, resolved = cli.diff_violations(prev, cur)
+    assert new == {"py-lint": ["31 | dup"]}
+    assert resolved == {}
+
+
+def test_diff_survives_growing_file_line_shift_end_to_end(tmp_path):
+    proj = tmp_path / "proj"
+    write(proj, "facts/2026/ok.md", FACT_OK)
+    # a `cmd` probe shaped like the real py-lint one: nonzero exit + raw
+    # grep -n output (line-numbered), so it fails exactly like ruff does
+    # when it finds something to flag
+    write(proj, "code.py", "x = 1\n" * 5 + "y = 2  # TODO real fix needed\n")
+    manifest = make_manifest(tmp_path, proj, extra={"probes": [
+        {"id": "fact-schema", "type": "frontmatter_required",
+         "glob": "facts/**/*.md", "required": ["id", "confidence"],
+         "severity": "warn", "source": "RULES.md §1"},
+        {"id": "todo-scan", "type": "cmd", "cmd": "grep -n TODO code.py && exit 1",
+         "on_fail": "warn", "source": "test fixture"},
+    ]})
+    state = tmp_path / "state"
+    run_check(manifest, tmp_path / "o1", state, diff=True)
+
+    # grow the file above the TODO line -> its line number shifts, content doesn't
+    write(proj, "code.py", "z = 0\n" * 10 + "x = 1\n" * 5
+          + "y = 2  # TODO real fix needed\n")
+    out2 = run_check(manifest, tmp_path / "o2", state, diff=True)
+    report2 = open(os.path.join(out2, "REPORT.md")).read()
+    new_section2 = report2.split("## New violations")[1].split("## Resolved")[0]
+    resolved_section2 = report2.split("## Resolved since last check")[1].split("(unchanged")[0]
+    assert "TODO" not in new_section2      # pure position shift: not new
+    assert "TODO" not in resolved_section2  # ...and not resolved either
+
+    # a genuinely different TODO further down IS new
+    write(proj, "code.py", "z = 0\n" * 10 + "x = 1\n" * 5
+          + "y = 2  # TODO real fix needed\n"
+          + "w = 3  # TODO a second, distinct issue\n")
+    out3 = run_check(manifest, tmp_path / "o3", state, diff=True)
+    report3 = open(os.path.join(out3, "REPORT.md")).read()
+    new_section3 = report3.split("## New violations")[1].split("## Resolved")[0]
+    assert "a second, distinct issue" in new_section3
+
+
 def test_always_report_distinguishes_clean_from_never_ran(tmp_path):
     # a probe declaring `always_report: true` must leave a [] key in
     # `violations` when it's clean, so downstream readers can tell "checked,

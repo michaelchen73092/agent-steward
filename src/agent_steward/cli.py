@@ -40,6 +40,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 
 try:
     import yaml
@@ -904,17 +905,54 @@ def record_fixes(sdir, project, resolved):
                                ensure_ascii=False) + "\n")
 
 
+
+# Line/col numbers embedded in a violation string (a `cmd` probe's raw tool
+# output — e.g. ruff's context-frame prefix `14380 |` or a `file:14381:5:`
+# header) are position, not identity: when the target file grows or shrinks
+# above the flagged spot, every number below the edit shifts even though the
+# underlying finding is unchanged. Matched only when immediately followed by
+# `|` or `:` (never bare, so version numbers like `0.20.1` in prose survive)
+# and not preceded by a word/dot char (so rule codes like `F841` don't count).
+_LINENO_RE = re.compile(r"(?<![\w.])\d+(?=\s*[|:])")
+
+
+def _violation_fingerprint(v):
+    """Diff key for a violation string: same text with embedded line/col
+    numbers blanked out, so a pure position shift fingerprints identically."""
+    return _LINENO_RE.sub("#", str(v))
+
+
 def diff_violations(prev, cur):
-    """prev/cur: {probe_id: [violation, ...]}. Returns (new, resolved)."""
+    """prev/cur: {probe_id: [violation, ...]}. Returns (new, resolved).
+
+    Compared by content fingerprint (line/col numbers stripped), not raw
+    text — a violation that only shifted line position (the file it's in
+    grew or shrank elsewhere) is neither new nor resolved. Multiset (Counter)
+    diff so genuine duplicates still track: if a fingerprint's count goes up,
+    the extra occurrences are new; if it goes down, the missing ones are
+    resolved.
+    """
     new, resolved = {}, {}
     for pid, vs in cur.items():
-        pv = set(prev.get(pid, []))
-        added = [v for v in vs if v not in pv]
+        pv = Counter(_violation_fingerprint(v) for v in prev.get(pid, []))
+        added = []
+        for v in vs:
+            fp = _violation_fingerprint(v)
+            if pv[fp] > 0:
+                pv[fp] -= 1
+            else:
+                added.append(v)
         if added:
             new[pid] = added
     for pid, vs in prev.items():
-        cv = set(cur.get(pid, []))
-        gone = [v for v in vs if v not in cv]
+        cv = Counter(_violation_fingerprint(v) for v in cur.get(pid, []))
+        gone = []
+        for v in vs:
+            fp = _violation_fingerprint(v)
+            if cv[fp] > 0:
+                cv[fp] -= 1
+            else:
+                gone.append(v)
         if gone:
             resolved[pid] = gone
     return new, resolved
