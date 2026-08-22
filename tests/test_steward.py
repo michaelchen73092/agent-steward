@@ -1667,3 +1667,68 @@ def test_tuning_effect_only_counts_tasks_tuning_actually_moved(tmp_path):
     assert sav["actual_cost"] == 54_000_000
     assert ", across 1 tuned task(s)" in \
         [x for x in a.spend_summary_lines(sav, alloc=alloc) if "cold-start" in x][0]
+
+
+# ---------------------------------------------------- source/install parity
+# T-20260821-66:兩份副本漂移(改了 source、忘記 pip install --user .)必須被機器
+# 抓到。兩側路徑一律注入 tmp_path,**不碰真 site-packages 也不碰真 source**
+# (公司規則 9:selftest 不得寫真產線帳;memory
+# `selftest-sandbox-arg-and-write-path-must-be-same-source`——讀哪一份就斷言哪一份)。
+
+def _mk_pkg(root, name, body):
+    """在 root 下造一份假 package 目錄(source 側走 src/agent_steward 佈局)。"""
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "cli.py").write_text(body, encoding="utf-8")
+    (d / "allocate.py").write_text("ALLOC = 1\n", encoding="utf-8")
+    return d
+
+
+def test_source_parity_matches(tmp_path):
+    """正案:兩份內容一致 → ok,detail 帶得出雜湊前綴(讀數不是空話)。"""
+    from agent_steward.cli import check_source_parity
+    src_root = tmp_path / "repo"
+    _mk_pkg(src_root / "src", "agent_steward", "X = 1\n")
+    inst = _mk_pkg(tmp_path / "site-packages", "agent_steward", "X = 1\n")
+    ok, detail = check_source_parity(installed_dir=str(inst),
+                                     source_root=str(src_root))
+    assert ok, detail
+    assert "parity ok" in detail
+
+
+def test_source_parity_detects_drift(tmp_path):
+    """反案(goal_anchor ②):source 已改、安裝副本還是舊的 → 必紅且指路重裝。
+
+    這就是 08-15→08-21 那七天的形狀:安裝副本停在舊碼,產線照跑,沒有任何訊號。
+    """
+    from agent_steward.cli import check_source_parity
+    src_root = tmp_path / "repo"
+    _mk_pkg(src_root / "src", "agent_steward", "X = 2  # 改過的 source\n")
+    inst = _mk_pkg(tmp_path / "site-packages", "agent_steward", "X = 1  # 舊安裝副本\n")
+    ok, detail = check_source_parity(installed_dir=str(inst),
+                                     source_root=str(src_root))
+    assert not ok
+    assert "Reinstall" in detail and "pip install --user" in detail
+
+
+def test_source_parity_drift_in_sibling_module(tmp_path):
+    """反案二:漂移不在 cli.py 而在 allocate.py(今天真的被改的就是這支)——
+    雜湊涵蓋全部 .py,所以照樣紅;只比 cli.py 的實作會漏掉這型。"""
+    from agent_steward.cli import check_source_parity
+    src_root = tmp_path / "repo"
+    src_pkg = _mk_pkg(src_root / "src", "agent_steward", "X = 1\n")
+    (src_pkg / "allocate.py").write_text("ALLOC = 2\n", encoding="utf-8")
+    inst = _mk_pkg(tmp_path / "site-packages", "agent_steward", "X = 1\n")
+    ok, _ = check_source_parity(installed_dir=str(inst), source_root=str(src_root))
+    assert not ok
+
+
+def test_source_parity_na_without_source_checkout(tmp_path):
+    """射程:machine 上沒有 source repo(純消費端)→ ok=True 且說明 n/a,
+    不對只裝了 wheel 的機器誤紅(fail-open 的邊界寫在函式裡,不留給呼叫端猜)。"""
+    from agent_steward.cli import check_source_parity
+    inst = _mk_pkg(tmp_path / "site-packages", "agent_steward", "X = 1\n")
+    ok, detail = check_source_parity(installed_dir=str(inst),
+                                     source_root=str(tmp_path / "no-such-repo"))
+    assert ok
+    assert "n/a" in detail

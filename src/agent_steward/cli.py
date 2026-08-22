@@ -35,6 +35,7 @@ import csv as csvmod
 import datetime as dt
 import fcntl
 import fnmatch
+import hashlib
 import io
 import json
 import os
@@ -211,6 +212,64 @@ def result(spec, ptype, status, detail="", violations=None, n_checked=0):
         "n_checked": n_checked, "n_violations": len(violations or []),
         "source": source, "detail": detail, "violations": violations or [],
     }
+
+# ------------------------------------------------- source/install parity
+# T-20260821-66(本族第 2 次:T-20260814-120 靠人記得、T-20260820-131+T-20260821-54
+# 連續掉同一坑):這支 CLI 以 `pip install --user .`(copy,**非** editable)裝進
+# site-packages,而 Stop hook 跑的是那份安裝副本——改了 source 卻忘記重裝時,產線
+# 跑的是舊碼,而且沒有任何訊號(08-15→08-21 停在舊版七天,期間 4 次假紅)。
+# 裁決=選項 B(GM 2026-08-21 核可):保留 copy 安裝的隔離性(editable 會讓編輯中/
+# 語法錯誤的 source 立刻成為所有租戶 Stop hook 的實跑碼,與 memory
+# `live-symlinked-file-must-compile-between-edits` 的紀律衝突),改把「有沒有重裝」
+# 變成機器可查——判例 `daemon-runs-stale-script-copy`(改完必重新載入)同族。
+
+def _package_dir():
+    """這支正在跑的副本是從哪個目錄被 import 的(site-packages 或 source)。"""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _hash_py_files(pkg_dir):
+    """對該目錄下**全部** .py 的檔名+內容取 sha256(排序後串接)。
+
+    不只 cli.py:allocate/ingest/route 任何一支漂移都要抓得到(今天 allocate.py
+    正好就是被改的那支)。__pycache__ 等非 .py 一律不計。
+    """
+    h = hashlib.sha256()
+    for name in sorted(os.listdir(pkg_dir)):
+        if name.endswith(".py"):
+            with open(os.path.join(pkg_dir, name), "rb") as f:
+                h.update(name.encode() + b"\0" + f.read())
+    return h.hexdigest()
+
+
+def check_source_parity(installed_dir=None, source_root=None):
+    """比對「正在跑的這份」與本機 source checkout。回 (ok: bool, detail: str)。
+
+    source repo 不在這台機器上(例:只裝了 wheel 的 CI/別台)→ 回 ok=True 並註明
+    n/a:這道閘只在**漂移有可能發生**的機器上開火,不對純消費端誤紅(fail-open
+    的射程寫在這裡,不留給呼叫端猜)。
+    """
+    installed_dir = installed_dir or _package_dir()
+    source_root = source_root or os.environ.get(
+        "AGENT_STEWARD_SOURCE", os.path.expanduser("~/agent-steward"))
+    source_pkg = os.path.join(source_root, "src", "agent_steward")
+    if not os.path.isdir(source_pkg):
+        return True, f"source checkout not found ({source_pkg}) — parity check n/a"
+    if os.path.realpath(source_pkg) == os.path.realpath(installed_dir):
+        return True, "running straight from source (editable/dev) — parity trivially ok"
+    try:
+        installed_hash = _hash_py_files(installed_dir)
+        source_hash = _hash_py_files(source_pkg)
+    except OSError as e:  # 讀不到=儀器壞了,不是「沒有漂移」——但也不擋產線
+        return True, f"parity check unavailable ({e})"
+    if installed_hash == source_hash:
+        return True, f"parity ok ({installed_hash[:8]})"
+    return False, (
+        f"installed copy ({installed_hash[:8]}) != source ({source_hash[:8]}) — "
+        f"改了 source 但沒重裝,Stop hook 跑的還是舊碼。"
+        f"Reinstall: cd {source_root} && python3 -m pip install --user ."
+    )
+
 
 # ---------------------------------------------------------------- probes
 # Every probe: fn(root, spec) -> result dict. Deterministic. Read-only.
@@ -1010,6 +1069,15 @@ def run(manifest_path, root_override=None, out_override=None,
     os.makedirs(sdir, exist_ok=True)
 
     results = []
+    # T-20260821-66:自比對先跑——它不依賴 manifest(每個 project 都該問一次),
+    # 落差走既有 --diff/--exit-new 管線(全公司每輪 Stop hook 都在看的那條),
+    # 不另建鈴:「沒有消費者的檢查」正是本卡 scope_decl 明文要避開的坑。
+    _parity_ok, _parity_detail = check_source_parity()
+    if not _parity_ok:
+        results.append(result(
+            {"id": "_self_parity", "source": "steward-self"}, "self", "fail",
+            detail=_parity_detail, n_checked=1,
+            violations=[f"agent-steward install/source drift: {_parity_detail}"]))
     for spec in mf.get("probes", []):
         ptype = spec["type"]
         if ptype == "cmd" and mode == "readonly" and not spec.get("readonly_safe"):
@@ -2329,6 +2397,16 @@ def cmd_report(args):
 
 # ---------------------------------------------------------------- cli
 
+def cmd_selfcheck(args=None):
+    """`steward selfcheck`:5 秒手動查「產線跑的這份 == source 嗎」。
+
+    rc=0 同版(或 n/a),rc=1 有落差且訊息附重裝指令——不必等 Stop hook 才知道。
+    """
+    ok, detail = check_source_parity()
+    print(f"[steward] source-parity: {detail}")
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser(prog="steward")
     sub = ap.add_subparsers(dest="cmd")  # optional: bare `steward` = status
@@ -2476,6 +2554,10 @@ def main():
     rp2.add_argument("--out", help="write to file instead of stdout")
     rp2.add_argument("--state-dir")
 
+    sub.add_parser("selfcheck",
+                   help="is the running (installed) copy the same code as the "
+                        "local source checkout? rc=1 when it drifted")
+
     ih = sub.add_parser("install-hook",
                         help="register check --diff as a Claude Code Stop hook")
     ih.add_argument("--manifest", required=True)
@@ -2517,6 +2599,8 @@ def main():
         sys.exit(cmd_approve(args))
     elif args.cmd == "report":
         sys.exit(cmd_report(args))
+    elif args.cmd == "selfcheck":
+        sys.exit(cmd_selfcheck(args))
     elif args.cmd == "install-hook":
         sys.exit(cmd_install_hook(args))
 
