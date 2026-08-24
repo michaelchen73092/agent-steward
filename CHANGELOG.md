@@ -3,6 +3,27 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.27.0 — 2026-08-24
+- Fix (T-20260824-91, E-21 下沉條款②): **`log-task` had zero write-time
+  guards.** A worker re-running `log-task` for a card already logged by its
+  dispatcher (E-21, 2026-08-15) produced a second, permanent row in an
+  append-only ledger — nothing checked whether that `(task, note)` pair had
+  already been written. Added a write-time dedup guard: a repeat of the same
+  `(task, note)` is now a no-op (exit 0, "already logged ... skipping
+  duplicate"), not a second line. Rows logged without `--note` are unaffected
+  (no key to dedup on, same as before).
+- Fix: **tier/model contradictions were warn-only.** `--tier top --model
+  claude-sonnet-5` used to append the row anyway with a warning on stderr —
+  "entry kept (append-only)". `.allocation.yaml` `tier_patterns` is now the
+  single SSoT for which tier a model belongs to: a declared tier that
+  contradicts it is REJECTED before anything is written (exit 1, message
+  names the correct tier). Models that match no tier pattern at all (new
+  model name, typo) stay warn-only — rejecting those would block every
+  legitimate new model on day one.
+- Both guards run before the row is appended, never after — the ledger is
+  append-only and a bad row can't be taken back, so write-time is the only
+  safe place to stop it.
+
 ## 0.26.0 — 2026-08-24
 - Fix: **main's test suite had been red since 0.25.0 (2026-08-21) without
   anyone noticing.** `tests/test_steward.py` already carried tests for a

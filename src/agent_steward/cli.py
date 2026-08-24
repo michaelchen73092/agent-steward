@@ -1419,6 +1419,10 @@ def cmd_log_task(args):
     agnostic and must not import a consumer's roster. The caller resolves the
     id (in AIR: `project_accounts.seat_holder(seat, project_id)`); rows written
     without it stay honestly un-attributed rather than guessed at.
+
+    T-20260824-91 (E-21 下沉條款②): two write-time guards, both fail *before*
+    anything is appended — the ledger is append-only and a bad row can never
+    be taken back, so the only safe place to stop it is here.
     """
     sdir = find_state_dir(args.state_dir)
     os.makedirs(sdir, exist_ok=True)
@@ -1433,30 +1437,64 @@ def cmd_log_task(args):
               "verdict and belongs on the shadow entry (--canary shadow)",
               file=sys.stderr)
     path = os.path.join(sdir, "usage_ledger.jsonl")
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    print(f"[steward] logged to {path}: {json.dumps(entry, ensure_ascii=False)}")
-    # observe-only data-quality warning: the ledger is append-only, so a
-    # tier/model contradiction is flagged at write time (while the logging
-    # agent can still fix its next entry) but the row is kept as-is
+
+    # ---- guard 1: write-time dedup on (task, note) ---------------------
+    # `--note` is the caller's dedup key (headless: `LOG_TASK_NOTE_FMT`
+    # "card=<tid> t=<ev_t>"; interactive: whatever the collector chooses).
+    # A worker that runs `log-task` itself when it was told not to (E-21,
+    # 2026-08-15) re-sends the *same* note the dispatcher already logged —
+    # that repeat must not become a second row. Entries with no `--note`
+    # carry no dedup signal and are always appended unchanged: dedup needs
+    # a key, not a guess at which rows "look" the same.
+    note = entry.get("note")
+    if note is not None and os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    prev = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                if prev.get("task") == entry["task"] and prev.get("note") == note:
+                    print(f"[steward] already logged at {prev.get('ts')} "
+                          f"(task={entry['task']!r} note={note!r}) — "
+                          f"skipping duplicate, ledger unchanged (idempotent)",
+                          file=sys.stderr)
+                    return 0
+
+    # ---- guard 2: tier/model single SSoT ---------------------------------
+    # `.allocation.yaml` `tier_patterns` is now the sole authority for which
+    # tier a model belongs to — a declared `--tier` that contradicts it is
+    # REJECTED (nothing written), not merely warned. Unknown models (match no
+    # tier at all) stay warn-only: rejecting those would block every
+    # legitimate new model name on day one.
     apath = args.allocation or ".allocation.yaml"
-    if entry.get("model") and os.path.exists(apath):
+    if entry.get("model") and entry.get("tier") and os.path.exists(apath):
         try:
             alloc = alloc_mod.load_allocation(apath)
         except yaml.YAMLError:
             alloc = None
         if alloc:
             mism, unknown = alloc_mod.ledger_mismatches(alloc, [entry])
-            for m in mism:
-                print(f"[steward] warning: tier '{m['tier']}' but model "
-                      f"'{m['model']}' matches tier(s) "
-                      f"{', '.join(m['matches_tiers'])} per tier_patterns — "
-                      f"entry kept (append-only); if mis-logged, correct the "
-                      f"next entry, do not edit the ledger", file=sys.stderr)
+            if mism:
+                m = mism[0]
+                print(f"[steward] REJECTED: tier '{m['tier']}' contradicts "
+                      f"model '{m['model']}' — per {apath} tier_patterns this "
+                      f"model belongs to tier(s) {', '.join(m['matches_tiers'])}. "
+                      f"Nothing written; retry with --tier "
+                      f"{m['matches_tiers'][0]} (or fix tier_patterns if the "
+                      f"table itself is wrong).", file=sys.stderr)
+                return 1
             for u in unknown:
                 print(f"[steward] warning: model '{u['model']}' matches no "
                       f"tier_patterns entry — new model name or a typo? "
                       f"(use the dispatcher-declared model id)", file=sys.stderr)
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(f"[steward] logged to {path}: {json.dumps(entry, ensure_ascii=False)}")
     return 0
 
 # ---------------------------------------------------------------- route (V2)

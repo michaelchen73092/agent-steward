@@ -688,9 +688,11 @@ def test_log_task_person_id_written_and_omitted(tmp_path):
     assert "person_id" not in rows[1]               # 反案:缺 = 缺,不是空字串
 
 
-def test_log_task_warns_on_tier_model_mismatch(tmp_path):
-    """Observe-only: a tier/model contradiction warns on stderr but the entry
-    is still appended (append-only ledger, exit 0)."""
+def test_log_task_rejects_tier_model_mismatch(tmp_path):
+    """T-20260824-91: `.allocation.yaml` tier_patterns is the single SSoT —
+    a tier/model contradiction is REJECTED (nothing written, exit 1, correct
+    tier printed), not merely warned. A matching declaration still logs
+    clean (exit 0, no warning)."""
     from agent_steward import allocate as am
     alloc = am.build_allocation({"tasks": [axes_task("condense", "med", "med", "med")]})
     apath = tmp_path / ".allocation.yaml"
@@ -700,12 +702,71 @@ def test_log_task_warns_on_tier_model_mismatch(tmp_path):
             "--task", "condense", "--model", "claude-sonnet-5",
             "--allocation", str(apath), "--state-dir", str(tmp_path / ".steward")]
     r = subprocess.run(base + ["--tier", "top"], capture_output=True, text=True, env=env)
-    assert r.returncode == 0, r.stderr
-    assert "matches tier(s) mid" in r.stderr
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "REJECTED" in r.stderr and "belongs to tier(s) mid" in r.stderr
+    assert not (tmp_path / ".steward" / "usage_ledger.jsonl").exists()
     r2 = subprocess.run(base + ["--tier", "mid"], capture_output=True, text=True, env=env)
-    assert r2.returncode == 0 and "warning" not in r2.stderr
+    assert r2.returncode == 0 and "REJECTED" not in r2.stderr and "warning" not in r2.stderr
     lines = open(tmp_path / ".steward" / "usage_ledger.jsonl").read().splitlines()
-    assert len(lines) == 2  # both entries kept, mismatch included
+    assert len(lines) == 1  # only the matching entry landed
+
+
+def test_log_task_unknown_model_still_warns_and_appends(tmp_path):
+    """Unknown models (match no tier_patterns entry at all) stay warn-only —
+    rejecting would block every legitimate new model name on day one."""
+    from agent_steward import allocate as am
+    alloc = am.build_allocation({"tasks": [axes_task("condense", "med", "med", "med")]})
+    apath = tmp_path / ".allocation.yaml"
+    am.write_allocation(alloc, str(apath))
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    r = subprocess.run(
+        [sys.executable, "-m", "agent_steward.cli", "log-task",
+         "--task", "condense", "--tier", "mid", "--model", "claude-brand-new-9",
+         "--allocation", str(apath), "--state-dir", str(tmp_path / ".steward")],
+        capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    assert "matches no" in r.stderr and "REJECTED" not in r.stderr
+    lines = open(tmp_path / ".steward" / "usage_ledger.jsonl").read().splitlines()
+    assert len(lines) == 1
+
+
+def test_log_task_dedup_same_note_is_idempotent(tmp_path):
+    """T-20260824-91 guard 1 — same (task, note) twice does not produce a
+    second row; the second call is a no-op (exit 0, unchanged line count).
+    A different note for the same task still appends normally."""
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    base = [sys.executable, "-m", "agent_steward.cli", "log-task",
+            "--task", "extract", "--tier", "mid", "--model", "claude-opus-4-8",
+            "--est-tokens", "1200", "--result", "pass",
+            "--note", "headless-dispatch card=T-1 t=2026-08-24T00:00:00",
+            "--state-dir", str(tmp_path / ".steward")]
+    r1 = subprocess.run(base, capture_output=True, text=True, env=env)
+    assert r1.returncode == 0, r1.stderr
+    r2 = subprocess.run(base, capture_output=True, text=True, env=env)
+    assert r2.returncode == 0, r2.stderr
+    assert "already logged" in r2.stderr and "skipping duplicate" in r2.stderr
+    lines = open(tmp_path / ".steward" / "usage_ledger.jsonl").read().splitlines()
+    assert len(lines) == 1  # second call was a no-op
+    r3 = subprocess.run(base[:-2] + ["--note", "headless-dispatch card=T-1 t=2026-08-24T00:00:01",
+                                      "--state-dir", str(tmp_path / ".steward")],
+                         capture_output=True, text=True, env=env)
+    assert r3.returncode == 0, r3.stderr
+    lines = open(tmp_path / ".steward" / "usage_ledger.jsonl").read().splitlines()
+    assert len(lines) == 2  # a genuinely new note still appends
+
+
+def test_log_task_no_note_never_dedups(tmp_path):
+    """Rows without --note carry no dedup key and are always appended —
+    unchanged from pre-T-20260824-91 behaviour (see test_log_task_appends_jsonl)."""
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    base = [sys.executable, "-m", "agent_steward.cli", "log-task",
+            "--task", "extract", "--tier", "mid", "--model", "claude-opus-4-8",
+            "--state-dir", str(tmp_path / ".steward")]
+    for _ in range(2):
+        r = subprocess.run(base, capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r.stderr
+    lines = open(tmp_path / ".steward" / "usage_ledger.jsonl").read().splitlines()
+    assert len(lines) == 2
 
 
 # ------------------------------------------- allocation layer (R2, zero-manual)
