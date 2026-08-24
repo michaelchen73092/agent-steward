@@ -201,6 +201,60 @@ def _model_in_tier(model, patterns):
                for p in patterns or [])
 
 
+def patterns_at(alloc, when=None):
+    """Which `tier_patterns` were in force at `when` (ISO string compare).
+
+    Restructuring the tier table must not rewrite the past. When
+    ai-industry-research split opus out of `mid` into its own `high` tier,
+    849 of 1111 historical entries would have turned into "mis-logged"
+    warnings overnight — every one of them correct under the table of its own
+    day. That is the same principle `_tier_at` already applies to provenance
+    stamps: a compliance judgment belongs to the rules that were in force
+    when the work happened.
+
+    `tier_patterns_history` entries record the patterns that applied BEFORE
+    their `at` timestamp:
+
+        tier_patterns_history:
+          - at: '2026-07-30T21:00:00'
+            patterns: {cheap: ['*haiku*'], mid: ['*sonnet*', '*opus*']}
+            reason: split opus into its own tier
+
+    Absent history, today's table applies to everything (old behaviour).
+    """
+    current = (alloc or {}).get("tier_patterns") or {}
+    hist = (alloc or {}).get("tier_patterns_history") or []
+    if not when or not hist:
+        return current
+    for h in sorted(hist, key=lambda x: str(x.get("at") or "")):
+        if h.get("at") and str(when) < str(h["at"]):
+            return h.get("patterns") or current
+    return current
+
+
+def price_tier(alloc, entry, patterns=None):
+    """The tier an entry is PRICED at — derived from the model actually
+    recorded, not the tier the dispatcher declared.
+
+    A declared tier is an intent; the model id is what was really spent. When
+    the two disagree the money followed the model, so that is what the cost
+    line must follow. Priced against TODAY's table on purpose: a price is a
+    fact about the world, and the newest table is the best-known price — the
+    opposite of `patterns_at`, which judges *compliance* and therefore belongs
+    to its own day. Falls back to the declared tier when the model is missing
+    or matches nothing.
+    """
+    pats = patterns if patterns is not None else (alloc or {}).get("tier_patterns") or {}
+    model, declared = entry.get("model"), str(entry.get("tier", ""))
+    if model and pats:
+        hits = [t for t, ps in pats.items() if _model_in_tier(model, ps)]
+        if len(hits) == 1:
+            return hits[0], True
+        if declared in hits:      # ambiguous glob — the declaration breaks the tie
+            return declared, False
+    return declared, False
+
+
 def ledger_mismatches(alloc, entries):
     """Ledger data-quality check (observe-only): entries whose recorded model
     name contradicts the declared tier per the allocation's tier_patterns
@@ -211,13 +265,14 @@ def ledger_mismatches(alloc, entries):
     one; unknown_models = model matches no tier at all (new model name or typo).
     Entries missing tier or model are skipped — completeness is rule 6's job,
     not this check's."""
-    pats = alloc.get("tier_patterns") or {}
     mismatches, unknown = [], []
-    if not pats:
+    if not (alloc.get("tier_patterns") or {}):
         return mismatches, unknown
     for e in entries:
+        # judged against the table of the entry's own day, never today's
+        pats = patterns_at(alloc, e.get("ts"))
         tier, model = e.get("tier"), e.get("model")
-        if not tier or not model or str(tier) not in pats:
+        if not pats or not tier or not model or str(tier) not in pats:
             continue
         if _model_in_tier(model, pats.get(str(tier))):
             continue
@@ -382,14 +437,33 @@ def apply_proposals(alloc, proposals):
 # ---------------------------------------------------------------- savings
 
 def initial_tiers(alloc):
-    """Reconstruct the cold-start tier per task from history (first 'from' wins)."""
+    """Reconstruct the cold-start tier per task from history (first 'from' wins).
+
+    Tasks with no tune history fall back to today's tier — a zero delta, which
+    is right for THIS function but wrong to feed into the tuning-effect
+    comparison (see `tuned_tasks`)."""
     init = {t["id"]: t["tier"] for t in alloc.get("tasks", [])}
     seen = set()
     for h in alloc.get("history", []):
-        if h["task"] not in seen:
+        if h.get("task") and h["task"] not in seen and h.get("from"):
             init[h["task"]] = h["from"]
             seen.add(h["task"])
     return init
+
+
+def tuned_tasks(alloc):
+    """Tasks tuning has actually moved — the only ones the cold-start
+    comparison can honestly speak about.
+
+    Everything else contributes a guaranteed-zero delta and, worse, drags the
+    baseline around: `initial_tiers` falls back to *today's* tier for a task
+    with no history, so renaming or re-labelling a tier for reasons that have
+    nothing to do with tuning silently redefines the cold start. Restructuring
+    ai-industry-research from 3 tiers to 4 swung the reported tuning effect
+    from -15.6% to +18.8% without a single dispatch changing. A number that
+    moves when nothing happened is not a measurement."""
+    return {h["task"] for h in (alloc or {}).get("history", [])
+            if h.get("task") and h.get("from") and h.get("to")}
 
 
 def compute_savings(entries, alloc=None):
@@ -401,10 +475,13 @@ def compute_savings(entries, alloc=None):
     weights = alloc.get("cost_weights", DEFAULT_WEIGHTS)
     top_w = weights.get(tiers[-1], max(weights.values()))
     init = initial_tiers(alloc)
+    tuned = tuned_tasks(alloc)
     out = {"entries": len(entries), "metered": 0, "no_tokens": 0,
+           "tuned_tasks": len(tuned),
            "unknown_tier": 0, "tokens_by_tier": {}, "entries_by_tier": {},
            "cost_by_tier": {},
            "actual_cost": 0, "top_cost": 0, "initial_cost": 0,
+           "declared_cost": 0, "priced_by_model": 0,
            "escalations": 0, "esc_by_task": {},
            "canary_runs": 0, "canary_cost": 0}
     for e in entries:
@@ -426,17 +503,28 @@ def compute_savings(entries, alloc=None):
             out["unknown_tier"] += 1
             continue
         out["metered"] += 1
-        out["tokens_by_tier"][tier] = out["tokens_by_tier"].get(tier, 0) + tok
-        out["entries_by_tier"][tier] = out["entries_by_tier"].get(tier, 0) + 1
-        out["cost_by_tier"][tier] = out["cost_by_tier"].get(tier, 0) + tok * weights[tier]
-        out["actual_cost"] += tok * weights[tier]
+        # Money follows the MODEL, not the declaration. The tune/cold-start
+        # comparison stays in table-land (declared tiers) so it keeps
+        # measuring what the table did; the headline cost measures what was
+        # actually spent. Mixing the two bases is how a report lies politely.
+        ptier, from_model = price_tier(alloc, e)
+        if from_model and ptier != tier:
+            out["priced_by_model"] += 1
+        pw = weights.get(ptier, weights[tier])
+        out["tokens_by_tier"][ptier] = out["tokens_by_tier"].get(ptier, 0) + tok
+        out["entries_by_tier"][ptier] = out["entries_by_tier"].get(ptier, 0) + 1
+        out["cost_by_tier"][ptier] = out["cost_by_tier"].get(ptier, 0) + tok * pw
+        out["actual_cost"] += tok * pw
         out["top_cost"] += tok * top_w
-        init_tier = init.get(str(e.get("task")), tier)
-        out["initial_cost"] += tok * weights.get(init_tier, weights[tier])
+        # cold-start comparison: only tasks tuning actually moved
+        if str(e.get("task")) in tuned:
+            out["declared_cost"] += tok * weights[tier]
+            init_tier = init.get(str(e.get("task")), tier)
+            out["initial_cost"] += tok * weights.get(init_tier, weights[tier])
     out["saved_vs_top"] = out["top_cost"] - out["actual_cost"]
     out["saved_vs_top_pct"] = (round(100 * out["saved_vs_top"] / out["top_cost"], 1)
                                if out["top_cost"] else None)
-    out["saved_vs_initial"] = out["initial_cost"] - out["actual_cost"]
+    out["saved_vs_initial"] = out["initial_cost"] - out["declared_cost"]
     out["saved_vs_initial_pct"] = (round(100 * out["saved_vs_initial"] / out["initial_cost"], 1)
                                    if out["initial_cost"] and alloc.get("history") else None)
     out["esc_rate"] = round(out["escalations"] / len(entries), 4) if entries else None
@@ -568,23 +656,73 @@ def tune_effect(alloc, entries):
     return out
 
 
-def spend_summary_lines(sav, weights_note=""):
+def _tuned_note(sav):
+    n = sav.get("tuned_tasks")
+    return f", across {n} tuned task(s)" if n else ""
+
+
+def money(alloc, value):
+    """Render a cost figure in the allocation's declared unit.
+
+    Default stays the historical unitless index, so existing tables keep
+    reading the same. Set `cost_unit: usd_per_mtok` and the engine reads
+    `cost_weights` as US$ per million tokens and prints real currency —
+    "$1,847" instead of "931,057,246", which is the difference between a
+    number you can act on and a number you have to trust.
+
+    The engine takes the weights as given: whether a weight blends input and
+    output pricing, and at what ratio, is the operator's modelling choice and
+    belongs in a comment in their allocation file, not in this code.
+    """
+    unit = str((alloc or {}).get("cost_unit", "")).lower()
+    if unit == "usd_per_mtok":
+        d = value / 1_000_000.0
+        return f"${d:,.2f}" if abs(d) < 1000 else f"${d:,.0f}"
+    return f"{round(value):,}"
+
+
+def cost_label(alloc, base="cost"):
+    """'cost index' when unitless, plain 'cost (USD)' when priced."""
+    unit = str((alloc or {}).get("cost_unit", "")).lower()
+    return f"{base} (USD)" if unit == "usd_per_mtok" else f"{base} index"
+
+
+def spend_summary_lines(sav, weights_note="", alloc=None):
     """Short savings block shared by check-report and cumulative report."""
     lines = [f"- metered: {sav['metered']} ledger entries"
              + (f" ({sav['no_tokens']} without est_tokens,"
                 f" {sav['unknown_tier']} with unknown tier)"
                 if sav["no_tokens"] or sav["unknown_tier"] else ""),
-             f"- estimated cost index: {round(sav['actual_cost']):,}{weights_note}"]
+             f"- estimated {cost_label(alloc)}: {money(alloc, sav['actual_cost'])}"
+             f"{weights_note}"]
     if sav["saved_vs_top_pct"] is not None:
-        lines.append(f"- **vs everything-on-top: saved {round(sav['saved_vs_top']):,} "
+        lines.append(f"- **vs everything-on-top: saved "
+                     f"{money(alloc, sav['saved_vs_top'])} "
                      f"({sav['saved_vs_top_pct']}%)**")
     if sav["saved_vs_initial_pct"] is not None:
-        lines.append(f"- vs cold-start table (tuning effect): saved "
-                     f"{round(sav['saved_vs_initial']):,} ({sav['saved_vs_initial_pct']}%)")
+        # Tuning is allowed to cost more — promotions buy quality. Reporting
+        # that as "saved -297,576,026 (-47.0%)" reads as a savings line that
+        # happens to be negative, which is the one number a reader skims and
+        # mis-files. Name it for what it is when it goes the other way.
+        d = sav["saved_vs_initial"]
+        if d < 0:
+            lines.append(f"- vs cold-start table (tuning effect): costs "
+                         f"{money(alloc, -d)} MORE "
+                         f"({abs(sav['saved_vs_initial_pct'])}%)"
+                         f" — tuning bought quality, not spend"
+                         f"{_tuned_note(sav)}")
+        else:
+            lines.append(f"- vs cold-start table (tuning effect): saved "
+                         f"{money(alloc, d)} ({sav['saved_vs_initial_pct']}%)"
+                         f"{_tuned_note(sav)}")
     if sav.get("canary_runs"):
         lines.append(f"- canary exploration: {sav['canary_runs']} shadow runs, "
-                     f"cost {round(sav['canary_cost']):,} (bounded regret, "
+                     f"cost {money(alloc, sav['canary_cost'])} (bounded regret, "
                      f"kept out of the savings math)")
+    if sav.get("priced_by_model"):
+        lines.append(f"- {sav['priced_by_model']} entr(ies) priced from the model "
+                     f"actually recorded, not the tier declared — the money "
+                     f"followed the model")
     lines.append("- caveat: estimates from est_tokens × declared cost weights, "
                  "not billing data")
     return lines

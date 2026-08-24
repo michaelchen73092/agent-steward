@@ -114,6 +114,40 @@ with a measured before/after in the report. Compliance is transition-aware: a
 stamp is judged against the table of *its* day OR today's — only matching
 neither is a violation.
 
+**Real money (0.21).** `cost_weights` are unitless by default. Set
+`cost_unit: usd_per_mtok` in `.allocation.yaml` and the engine reads them as
+US$ per million tokens, so the report prints `$872.68` instead of a
+`931,057,246` index. Whether a weight blends input and output pricing, and at
+what ratio, is your modelling choice — put it in a comment next to the
+numbers; the engine takes the weights as given.
+
+**Cost follows the model, not the declaration.** When an entry records a
+`model`, it is priced at the tier that model matches today, not the tier the
+dispatcher declared. A declaration is an intent; the model id is what was
+actually spent. The report says how many entries this affected.
+
+**Restructuring the table does not rewrite the past.** `tier_patterns_history`
+records the patterns that applied *before* a given timestamp:
+
+```yaml
+tier_patterns_history:
+  - at: '2026-07-30T21:00:00'
+    patterns: {cheap: ['*haiku*'], mid: ['*sonnet*', '*opus*']}
+    reason: split opus into its own tier
+```
+
+Mis-logged-model warnings are then judged against the table of the entry's own
+day. Without it, splitting one tier in two turned 849 of 1111 real entries
+into "mis-logged" overnight. Pricing deliberately does the opposite and always
+uses today's table: a compliance judgment belongs to its day, a price does not.
+
+**Tuning effect counts only tuned tasks.** The cold-start comparison covers
+tasks that appear in `history` with a real `from`/`to`. Tasks tuning never
+touched would contribute a guaranteed-zero delta *and* drag the baseline,
+because the cold-start reconstruction falls back to today's tier — which meant
+an unrelated re-label could swing the number from -15.6% to +18.8% with no
+dispatch changing.
+
 **Report money sections:** savings vs everything-on-top, per-tier
 "Where the money goes" table, per-task **CPAU** (all-run cost ÷ accepted
 runs — waste is part of the price), escalation matrix, canary quality table.

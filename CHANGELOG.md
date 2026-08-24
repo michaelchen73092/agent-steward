@@ -3,6 +3,30 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.26.0 — 2026-08-24
+- Fix: **main's test suite had been red since 0.25.0 (2026-08-21) without
+  anyone noticing.** `tests/test_steward.py` already carried tests for a
+  real-money pricing / tuning-honesty feature (`patterns_at`, `price_tier`,
+  `money`, `tuned_tasks`, `tier_patterns_history`) committed at 8ee6cb4, but
+  the implementation in `src/agent_steward/allocate.py` was never `git add`ed
+  — it sat as an uncommitted local edit on this machine only (last touched
+  2026-08-21, same day as the 0.25.0 commit, whose message claims "pytest 90
+  passed" — almost certainly run against this same uncommitted tree). A
+  fresh clone or CI checkout would have shown 10 failing tests since that
+  commit; nothing surfaced it because the only machine that runs this repo's
+  tests still had the uncommitted fix sitting in the working tree. Found
+  and recovered while working T-20260824-91 (unrelated task, same
+  `usage_ledger.jsonl` write path). Committing the implementation as-is
+  (already fully tested, 93 passed) rather than leaving it stashed.
+- Feature carried by this recovery: `cost_unit: usd_per_mtok` prints real
+  dollars instead of a unitless index; cost is priced from the model actually
+  recorded rather than the declared tier when the two disagree; the
+  tuning-effect comparison only counts tasks tuning actually touched (a
+  tier restructure used to swing the reported effect by 60+ points with no
+  dispatch changing); `tier_patterns_history` lets `tier_patterns` be
+  restructured without turning yesterday's correct entries into today's
+  "mis-logged" warnings.
+
 ## 0.24.0 — 2026-08-21
 - Fix: **`state.json`'s read-diff-write had no lock.** Every `steward check
   --diff` process — one per session's Stop hook, and this project routinely
