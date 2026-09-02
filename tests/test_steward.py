@@ -657,10 +657,12 @@ def test_allocation_compliance_uses_tier_patterns_of_the_stamps_day(tmp_path):
     assert "undated.md" in joined           # undatable stamp -> today's rules apply
     assert "wrong-both.md" in joined
     assert r["n_violations"] == 3, joined
-    # a stamp that matches neither era says so, instead of implying the
-    # current table was the only one ever consulted
-    assert "tier_patterns also differed at stamp time" in \
-        next(v for v in r["violations"] if "wrong-both.md" in v)
+    # the violation string stays byte-identical to the pre-fix wording:
+    # `check --diff` keys on it, so a cosmetic change re-reports every
+    # surviving violation as "new".
+    assert next(v for v in r["violations"] if "wrong-both.md" in v) == \
+        ("facts/x/wrong-both.md: task 'condense' declared tier 'mid', "
+         "got produced_by='claude-haiku-4-5'")
 
     # negative control: without the history the pre-split stamp goes red again.
     # Without this the assertions above cannot tell "the fix works" from "this

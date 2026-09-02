@@ -18,10 +18,10 @@ pragmatism: minor bumps for features, patch bumps for docs/fixes.
   stamped_at)`: a stamp passes if it was compliant under the rules of its own
   day (tier-then + globs-then) **or** under today's (tier-now + globs-now).
   Undated stamps (no `stamped_at`) keep being judged by today's table — the
-  same fallback `_tier_at` takes; there is nothing to date them by. Violation
-  text now says when the glob table also differed at stamp time, so a red is
-  never silently attributed to the current table alone. Manifest-inline
-  `tier_patterns` still override the allocation file, unchanged.
+  same fallback `_tier_at` takes; there is nothing to date them by. The
+  violation string is deliberately unchanged (`check --diff` keys on it, so
+  a cosmetic edit re-reports every surviving violation as "new"). Manifest-
+  inline `tier_patterns` still override the allocation file, unchanged.
 - Landed (T-20260901-118): `allocate.classify_model()` resolves a model name
   to one tier by longest-glob-wins; `log-task` guard 2 now REJECTs (writes
   nothing) a model matching **no** tier pattern or matching two tiers at equal

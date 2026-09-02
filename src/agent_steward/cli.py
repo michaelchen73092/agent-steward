@@ -812,11 +812,14 @@ def probe_allocation_compliance(root, spec):
         if not ok:
             span = (f"'{then}' at stamp time / '{table[task]}' now"
                     if then != table[task] else f"'{table[task]}'")
-            era = "" if then_pats == tier_patterns else (
-                " (tier_patterns also differed at stamp time; neither table "
-                "puts this model in that tier)")
+            # message text is deliberately byte-identical to the pre-fix
+            # version: `--diff` keys on the violation string, so any wording
+            # change re-reports every surviving violation as "new". An
+            # "the table also changed since" note would have fired on 78/78
+            # of them (every stamp older than the last table edit) -- no
+            # discriminating value, one churn of the whole baseline.
             bad.append(f"{rel}: task '{task}' declared tier {span}, "
-                       f"got produced_by='{model}'{era}")
+                       f"got produced_by='{model}'")
     return result(spec, "allocation_compliance",
                   "pass" if not bad else spec.get("severity", "warn"),
                   f"table={len(table)} tasks, stamped={n}, unstamped={unstamped}",
