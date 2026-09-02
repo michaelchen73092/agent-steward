@@ -162,9 +162,14 @@ ALLOCATION_HEADER = """\
 
 
 def render_allocation(alloc):
-    return (ALLOCATION_HEADER % alloc.get("rubric", RUBRIC_VERSION)
-            + yaml.safe_dump(alloc, sort_keys=False, allow_unicode=True,
+    body = dict(alloc)
+    comments = body.pop("preserved_comments", None)
+    text = (ALLOCATION_HEADER % alloc.get("rubric", RUBRIC_VERSION)
+            + yaml.safe_dump(body, sort_keys=False, allow_unicode=True,
                              default_flow_style=None))
+    if comments:
+        text += "\n" + "\n\n".join(comments) + "\n"
+    return text
 
 
 def load_allocation(path):
@@ -172,9 +177,58 @@ def load_allocation(path):
         return yaml.safe_load(f) or {}
 
 
+def _strip_leading_header_comments(raw_text):
+    """Drop the regenerated ALLOCATION_HEADER (a run of '#' lines at the very
+    top of the file) so it is never re-captured as a human-written comment."""
+    lines = raw_text.splitlines(keepends=True)
+    i = 0
+    while i < len(lines) and lines[i].lstrip().startswith("#"):
+        i += 1
+    return "".join(lines[i:])
+
+
+def extract_freestanding_comments(raw_text):
+    """Return the free-standing ('#'-only line, not attached to any key)
+    comment blocks in an existing .allocation.yaml body, excluding the
+    regenerated leading header. yaml.safe_load drops every comment on read
+    (T-20260901-125: write_allocation used to re-serialize the parsed dict
+    with yaml.safe_dump and silently lose them). Comments trailing a data
+    line on the same line (e.g. `key: value  # note`) are out of scope —
+    this only recovers standalone lines/blocks.
+    """
+    body = _strip_leading_header_comments(raw_text)
+    blocks, current = [], []
+    for line in body.splitlines():
+        if line.lstrip().startswith("#"):
+            current.append(line)
+        elif current:
+            blocks.append("\n".join(current))
+            current = []
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
 def write_allocation(alloc, path):
+    """Serialize `alloc` to `path`. Before overwriting, re-reads whatever is
+    currently on disk and folds forward any free-standing comments it finds
+    (see extract_freestanding_comments) into a `preserved_comments` field, so
+    a human note written directly into the YAML survives the next tune/init
+    round-trip instead of vanishing without a trace (T-20260901-125)."""
+    preserved = list(alloc.get("preserved_comments") or [])
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            old_raw = f.read()
+        for block in extract_freestanding_comments(old_raw):
+            if block not in preserved:
+                preserved.append(block)
+    to_write = dict(alloc)
+    if preserved:
+        to_write["preserved_comments"] = preserved
+    else:
+        to_write.pop("preserved_comments", None)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(render_allocation(alloc))
+        f.write(render_allocation(to_write))
 
 # ---------------------------------------------------------------- ledger
 
@@ -199,6 +253,38 @@ def read_ledger(state_dir, project=None):
 def _model_in_tier(model, patterns):
     return any(fnmatch.fnmatch(str(model).lower(), str(p).lower())
                for p in patterns or [])
+
+
+def classify_model(model, patterns):
+    """Resolve a model name to exactly one tier by longest-glob-wins.
+
+    T-20260901-109/T-20260901-118 (`state/gm/rulings/
+    T-20260901-109-opus5-tier-ruling.md`): a table can carry both a generic
+    catch-all (`*opus*`) and a specific pattern (`*opus-5*`) in different
+    tiers without the two silently fighting — the more SPECIFIC pattern
+    (longest literal glob string) wins. A model whose best match is tied
+    across two or more tiers is a genuine table conflict ("ambiguous"); a
+    model matching nothing is a name the table has never seen ("unknown").
+    Both are write-time REJECTs in `cmd_log_task`, not silent guesses: the
+    point is that the next new model name surfaces on day one instead of
+    quietly accumulating mis-priced rows under the nearest wildcard.
+
+    Returns (tier_or_None, status) with status in {"ok", "ambiguous", "unknown"}.
+    """
+    model_l = str(model).lower()
+    best_len = {}
+    for tier, pats in (patterns or {}).items():
+        lens = [len(str(p)) for p in (pats or [])
+                if fnmatch.fnmatch(model_l, str(p).lower())]
+        if lens:
+            best_len[tier] = max(lens)
+    if not best_len:
+        return None, "unknown"
+    top_len = max(best_len.values())
+    winners = sorted(t for t, n in best_len.items() if n == top_len)
+    if len(winners) > 1:
+        return None, "ambiguous"
+    return winners[0], "ok"
 
 
 def patterns_at(alloc, when=None):

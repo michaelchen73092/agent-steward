@@ -739,23 +739,131 @@ def test_log_task_tier_model_guard_walks_up_for_allocation_file(tmp_path):
     assert not ledger.exists()  # nothing written from either directory
 
 
-def test_log_task_unknown_model_still_warns_and_appends(tmp_path):
-    """Unknown models (match no tier_patterns entry at all) stay warn-only —
-    rejecting would block every legitimate new model name on day one."""
+def test_log_task_rejects_unknown_model_with_ruling_ref(tmp_path):
+    """T-20260901-109/118: an unknown model (matches no tier_patterns entry
+    at all) is now REJECTED, not merely warned — the original warn-only
+    behaviour let 1,181 `claude-opus-5` rows land silently at the nearest
+    wildcard once `*opus*` stopped separating two cost tiers. When the table
+    carries `tier_patterns_ref` (the ruling this table implements), the
+    REJECT message must echo it so the very first collision has a place to
+    go, not just a dead end (Owner rule 2: no gate without a destination)."""
     from agent_steward import allocate as am
     alloc = am.build_allocation({"tasks": [axes_task("condense", "med", "med", "med")]})
+    # post-split table (T-20260901-109 §②): no generic `*opus*` catch-all left,
+    # so a brand-new opus generation matches neither `*opus-4*` nor `*opus-5*`
+    alloc["tier_patterns"] = {"cheap": ["*haiku*"],
+                              "mid": ["*sonnet*", "*opus-4*", "opus"],
+                              "top": ["*fable*", "*mythos*", "*opus-5*", "human"]}
+    alloc["tier_patterns_ref"] = "state/gm/rulings/T-20260901-109-opus5-tier-ruling.md"
     apath = tmp_path / ".allocation.yaml"
     am.write_allocation(alloc, str(apath))
     env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
     r = subprocess.run(
         [sys.executable, "-m", "agent_steward.cli", "log-task",
-         "--task", "condense", "--tier", "mid", "--model", "claude-brand-new-9",
+         "--task", "condense", "--tier", "mid", "--model", "claude-opus-9",
          "--allocation", str(apath), "--state-dir", str(tmp_path / ".steward")],
         capture_output=True, text=True, env=env)
-    assert r.returncode == 0, r.stderr
-    assert "matches no" in r.stderr and "REJECTED" not in r.stderr
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "REJECTED" in r.stderr and "matches no" in r.stderr
+    assert "state/gm/rulings/T-20260901-109-opus5-tier-ruling.md" in r.stderr
+    assert not (tmp_path / ".steward" / "usage_ledger.jsonl").exists()
+
+
+def test_log_task_opus5_top_accepted_opus5_mid_rejected(tmp_path):
+    """T-20260901-109 §②: `*opus*` is split so `claude-opus-5` (top, the
+    judgment/adjudication model) and `claude-opus-4-8` (mid, the condense
+    work-horse named in CLAUDE.md autorun rule 2) are no longer the same
+    cost tier. `--tier top --model claude-opus-5` must log clean; the same
+    model declared `--tier mid` must REJECT (money followed the wrong tier
+    for 1,181 historical rows — the write-time guard is what stops row
+    1,182)."""
+    from agent_steward import allocate as am
+    alloc = am.build_allocation({"tasks": [axes_task("adjudicate", "high", "high", "high")]})
+    alloc["tier_patterns"] = {"cheap": ["*haiku*"],
+                              "mid": ["*sonnet*", "*opus-4*", "opus"],
+                              "top": ["*fable*", "*mythos*", "*opus-5*", "human"]}
+    apath = tmp_path / ".allocation.yaml"
+    am.write_allocation(alloc, str(apath))
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    base = [sys.executable, "-m", "agent_steward.cli", "log-task",
+            "--task", "adjudicate", "--model", "claude-opus-5",
+            "--allocation", str(apath), "--state-dir", str(tmp_path / ".steward")]
+    r_top = subprocess.run(base + ["--tier", "top"], capture_output=True, text=True, env=env)
+    assert r_top.returncode == 0 and "REJECTED" not in r_top.stderr, r_top.stderr
+    r_mid = subprocess.run(base + ["--tier", "mid"], capture_output=True, text=True, env=env)
+    assert r_mid.returncode == 1, r_mid.stdout + r_mid.stderr
+    assert "REJECTED" in r_mid.stderr and "belongs to tier(s) top" in r_mid.stderr
     lines = open(tmp_path / ".steward" / "usage_ledger.jsonl").read().splitlines()
-    assert len(lines) == 1
+    assert len(lines) == 1  # only the --tier top call landed
+
+
+def test_log_task_rejects_ambiguous_tie_between_tiers(tmp_path):
+    """T-20260901-109 §②: a model tied for the longest matching glob across
+    two tiers is a genuine table conflict `classify_model` cannot resolve by
+    specificity — REJECT, don't guess (this is the other new leg alongside
+    'unknown', both added without touching the direction of the existing
+    mismatch REJECT, T-20260824-91)."""
+    from agent_steward import allocate as am
+    alloc = am.build_allocation({"tasks": [axes_task("condense", "med", "med", "med")]})
+    alloc["tier_patterns"] = {"mid": ["*opusx*"], "top": ["*opusx*"]}
+    apath = tmp_path / ".allocation.yaml"
+    am.write_allocation(alloc, str(apath))
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    r = subprocess.run(
+        [sys.executable, "-m", "agent_steward.cli", "log-task",
+         "--task", "condense", "--tier", "mid", "--model", "claude-opusx-1",
+         "--allocation", str(apath), "--state-dir", str(tmp_path / ".steward")],
+        capture_output=True, text=True, env=env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "REJECTED" in r.stderr and "ambiguous" in r.stderr
+    assert not (tmp_path / ".steward" / "usage_ledger.jsonl").exists()
+
+
+def test_classify_model_longest_glob_wins_over_a_generic_catchall():
+    """The mechanism behind the opus split: a specific glob in one tier beats
+    a generic catch-all in another, so the table does not need every old
+    catch-all removed to add a new specific tier."""
+    from agent_steward import allocate as am
+    pats = {"mid": ["*opus*"], "top": ["*opus-5*"]}
+    assert am.classify_model("claude-opus-5", pats) == ("top", "ok")
+    assert am.classify_model("claude-opus-4-8", pats) == ("mid", "ok")
+    assert am.classify_model("claude-haiku-4-5", pats) == (None, "unknown")
+    assert am.classify_model("x", {"a": ["*x*"], "b": ["*x*"]}) == (None, "ambiguous")
+
+
+def test_allocate_tune_patterns_spec_propose_then_apply(tmp_path):
+    """The pattern-level counterpart of a tier proposal (T-20260901-109/118):
+    `.allocation.yaml` `tier_patterns` must never be hand-edited — propose
+    prints a diff and changes nothing; `--apply` writes the new table AND
+    snapshots the old one into `tier_patterns_history` so `patterns_at` keeps
+    judging every past ledger row against the table of its own day."""
+    from agent_steward import allocate as am
+    alloc = am.build_allocation({"tasks": [axes_task("condense", "med", "med", "med")]})
+    old_patterns = dict(alloc["tier_patterns"])
+    apath = tmp_path / ".allocation.yaml"
+    am.write_allocation(alloc, str(apath))
+    spec = {"patterns": {"cheap": ["*haiku*"], "mid": ["*sonnet*", "*opus-4*", "opus"],
+                        "top": ["*fable*", "*mythos*", "*opus-5*", "human"]},
+            "reason": "T-20260901-109 ruling: opus-5 is its own cost tier",
+            "ref": "state/gm/rulings/T-20260901-109-opus5-tier-ruling.md"}
+    spath = tmp_path / "spec.yaml"
+    spath.write_text(yaml.safe_dump(spec), encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    base = [sys.executable, "-m", "agent_steward.cli", "allocate", "tune",
+            "--allocation", str(apath), "--patterns-spec", str(spath)]
+    r_propose = subprocess.run(base, capture_output=True, text=True, env=env)
+    assert r_propose.returncode == 0, r_propose.stderr
+    assert "propose" in r_propose.stdout
+    assert am.load_allocation(str(apath))["tier_patterns"] == old_patterns  # unchanged
+    r_apply = subprocess.run(base + ["--apply"], capture_output=True, text=True, env=env)
+    assert r_apply.returncode == 0, r_apply.stderr
+    written = am.load_allocation(str(apath))
+    assert written["tier_patterns"] == spec["patterns"]
+    assert written["tier_patterns_ref"] == spec["ref"]
+    hist = written["tier_patterns_history"][-1]
+    assert hist["patterns"] == old_patterns and "T-20260901-109" in hist["reason"]
+    # the snapshot lets a historical row still be judged by the table of its day
+    assert am.patterns_at(written, "2026-01-01T00:00:00") == old_patterns
 
 
 def test_log_task_dedup_same_note_is_idempotent(tmp_path):
@@ -906,6 +1014,77 @@ def test_tune_reports_ledger_mismatch(tmp_path):
                        capture_output=True, text=True, env=env)
     assert r.returncode == 0, r.stderr
     assert "ledger data-quality" in r.stdout and "claude-sonnet-5" in r.stdout
+
+
+def test_extract_freestanding_comments_ignores_header_and_key_trailing():
+    header = alloc_mod.ALLOCATION_HEADER % alloc_mod.RUBRIC_VERSION
+    body = ("version: 1\n"
+            "history:\n"
+            "- {at: '2026-01-01T00:00:00', task: x}\n"
+            "# 2026-08-18 GM 回滾註:this is a free-standing note\n"
+            "# spanning two lines\n"
+            "tier_patterns_history: []\n"
+            "trailing_key: value  # this is attached to a key, out of scope\n")
+    blocks = alloc_mod.extract_freestanding_comments(header + body)
+    assert blocks == ["# 2026-08-18 GM 回滾註:this is a free-standing note\n"
+                       "# spanning two lines"]
+    # the regenerated header itself must never be captured as a "human note"
+    assert not any("generated by `steward allocate init`" in b for b in blocks)
+
+
+def test_write_allocation_preserves_freestanding_comment_across_tune_apply(tmp_path):
+    """T-20260901-125: write_allocation used to re-serialize .allocation.yaml
+    with yaml.safe_dump on the *parsed* dict — yaml.safe_load drops comments on
+    read, so any free-standing human note (not attached to a key) vanished
+    silently on the very next `allocate tune --apply`, with no error or
+    warning (real incident: a 2026-08-18 GM rollback note, T-20260901-118).
+    Fixed by folding forward any free-standing comment found on disk into a
+    `preserved_comments` field before every write (extract_freestanding_
+    comments + write_allocation)."""
+    alloc = alloc_mod.build_allocation({"tasks": [axes_task("condense", "med", "med", "med")]})
+    apath = tmp_path / ".allocation.yaml"
+    alloc_mod.write_allocation(alloc, str(apath))
+    note = ("# 2026-08-18 GM 回滾註:tune apply once demoted this task on thin\n"
+            "# evidence; rolled back to mid by hand, kept here for the next reader.")
+    with open(apath, "a", encoding="utf-8") as f:
+        f.write("\n" + note + "\n")
+    assert note in apath.read_text(encoding="utf-8")   # sanity: fixture really has it
+
+    sdir = tmp_path / ".steward"
+    ledger_write(str(sdir), [{"ts": "2026-01-01T00:00:00", "task": "condense",
+                              "tier": "mid", "result": "pass"}] * 25)
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    base = [sys.executable, "-m", "agent_steward.cli", "allocate", "tune",
+            "--allocation", str(apath), "--state-dir", str(sdir), "--apply"]
+
+    r1 = subprocess.run(base, capture_output=True, text=True, env=env)
+    assert r1.returncode == 0, r1.stderr
+    assert "applied 1 change" in r1.stdout                     # the demote really ran
+    after1 = apath.read_text(encoding="utf-8")
+    assert note in after1                                      # the note survived apply #1
+    reloaded = alloc_mod.load_allocation(str(apath))
+    assert {t["id"]: t["tier"] for t in reloaded["tasks"]}["condense"] == "cheap"
+
+    # a second apply (no-op tune, nothing left to propose) must not duplicate
+    # the note nor lose it — the fold-forward has to be a stable fixed point.
+    r2 = subprocess.run(base, capture_output=True, text=True, env=env)
+    assert r2.returncode == 0, r2.stderr
+    after2 = apath.read_text(encoding="utf-8")
+    assert after2.count(note) == 1
+
+
+def test_render_allocation_round_trips_real_allocation_file_without_loss():
+    """Compatibility check (T-20260901-125 acceptance ③): the shape change
+    (popping/re-appending `preserved_comments`) must not corrupt a real,
+    already-in-production .allocation.yaml — load -> write -> load must be a
+    no-op on every ordinary (non-comment) field."""
+    real_path = os.environ.get("T125_REAL_ALLOCATION_YAML")
+    if not real_path or not os.path.exists(real_path):
+        pytest.skip("real .allocation.yaml not provided via T125_REAL_ALLOCATION_YAML")
+    before = alloc_mod.load_allocation(real_path)
+    rendered = alloc_mod.render_allocation(before)
+    after = yaml.safe_load(rendered)
+    assert after == before                      # one write/read cycle, zero data drift
 
 
 # ---------------------------------------------------------------- canary (R3)

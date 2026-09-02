@@ -1512,9 +1512,22 @@ def cmd_log_task(args):
     # ---- guard 2: tier/model single SSoT ---------------------------------
     # `.allocation.yaml` `tier_patterns` is now the sole authority for which
     # tier a model belongs to — a declared `--tier` that contradicts it is
-    # REJECTED (nothing written), not merely warned. Unknown models (match no
-    # tier at all) stay warn-only: rejecting those would block every
-    # legitimate new model name on day one.
+    # REJECTED (nothing written), not merely warned.
+    #
+    # T-20260901-109/T-20260901-118 (`state/gm/rulings/
+    # T-20260901-109-opus5-tier-ruling.md`): the original guard warned (but
+    # still wrote) on a model matching NO tier pattern, on the theory that
+    # rejecting would block every legitimate new model name on day one. In
+    # practice that let 1,181 `claude-opus-5` rows land silently at the
+    # *nearest* tier once `*opus*` stopped being precise enough to separate
+    # two different cost tiers — the failure was never loud. The table is
+    # now required to name every model it is asked to price: a model
+    # matching NOTHING, or matching two tiers at equal specificity (a real
+    # conflict in the table `classify_model` cannot resolve by
+    # longest-glob-wins), is REJECTED just like a declared/actual mismatch.
+    # This is the "有收件人" version of the same failure: the very first
+    # `log-task` call for a new model name now stops and asks, instead of
+    # accumulating a thousand mis-priced rows before anyone notices.
     apath = find_allocation_file(args.allocation)
     if entry.get("model") and entry.get("tier") and os.path.exists(apath):
         try:
@@ -1522,20 +1535,32 @@ def cmd_log_task(args):
         except yaml.YAMLError:
             alloc = None
         if alloc:
-            mism, unknown = alloc_mod.ledger_mismatches(alloc, [entry])
-            if mism:
-                m = mism[0]
-                print(f"[steward] REJECTED: tier '{m['tier']}' contradicts "
-                      f"model '{m['model']}' — per {apath} tier_patterns this "
-                      f"model belongs to tier(s) {', '.join(m['matches_tiers'])}. "
-                      f"Nothing written; retry with --tier "
-                      f"{m['matches_tiers'][0]} (or fix tier_patterns if the "
-                      f"table itself is wrong).", file=sys.stderr)
+            pats = alloc.get("tier_patterns") or {}
+            ref = alloc.get("tier_patterns_ref")
+            ref_note = f" See {ref} for the ruling this table implements." if ref else ""
+            resolved, status = alloc_mod.classify_model(entry["model"], pats)
+            if status == "unknown":
+                print(f"[steward] REJECTED: model '{entry['model']}' matches "
+                      f"no tier_patterns entry in {apath} — new model name or "
+                      f"a typo? Nothing written; add it to tier_patterns "
+                      f"before logging (use the dispatcher-declared model "
+                      f"id).{ref_note}", file=sys.stderr)
                 return 1
-            for u in unknown:
-                print(f"[steward] warning: model '{u['model']}' matches no "
-                      f"tier_patterns entry — new model name or a typo? "
-                      f"(use the dispatcher-declared model id)", file=sys.stderr)
+            if status == "ambiguous":
+                print(f"[steward] REJECTED: model '{entry['model']}' matches "
+                      f"patterns in more than one tier of {apath} at equal "
+                      f"specificity — the table is ambiguous for this model. "
+                      f"Nothing written; fix tier_patterns so one glob is "
+                      f"more specific than the other.{ref_note}", file=sys.stderr)
+                return 1
+            if resolved != str(entry["tier"]):
+                print(f"[steward] REJECTED: tier '{entry['tier']}' contradicts "
+                      f"model '{entry['model']}' — per {apath} tier_patterns this "
+                      f"model belongs to tier(s) {resolved}. "
+                      f"Nothing written; retry with --tier "
+                      f"{resolved} (or fix tier_patterns if the "
+                      f"table itself is wrong).{ref_note}", file=sys.stderr)
+                return 1
 
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -2059,6 +2084,60 @@ def cmd_install_hook(args):
 
 # ---------------------------------------------------------------- allocate (R2)
 
+def cmd_allocate_tune_patterns(args, alloc, path):
+    """`steward allocate tune --patterns-spec SPEC.yaml [--apply]`.
+
+    T-20260901-109/T-20260901-118: `.allocation.yaml` `tier_patterns` was
+    never meant to be hand-edited (the file header says as much for `tasks`;
+    the same discipline was just missing for the glob table itself). This is
+    the pattern-level counterpart of the existing task-tier tune proposal:
+    propose-by-default, `--apply` writes, and the OLD table is snapshotted
+    into `tier_patterns_history` (already consumed by `patterns_at` /
+    `ledger_mismatches` to judge each ledger row against the table that was
+    in force on its own day) so restructuring the table never silently
+    reclassifies the past.
+
+    SPEC file shape:
+        patterns: {tier: [glob, ...], ...}   # required — the proposed table
+        reason: "..."                        # optional, recorded in history
+        ref: "path/to/ruling.md"             # optional, stored as
+                                              # tier_patterns_ref and echoed
+                                              # in future guard-2 REJECTs
+    """
+    with open(args.patterns_spec, encoding="utf-8") as f:
+        spec = yaml.safe_load(f) or {}
+    new_patterns = spec.get("patterns")
+    if not new_patterns:
+        print(f"[steward] --patterns-spec {args.patterns_spec} has no "
+              f"`patterns:` key — nothing to propose", file=sys.stderr)
+        return 1
+    old_patterns = alloc.get("tier_patterns") or {}
+    if old_patterns == new_patterns and alloc.get("tier_patterns_ref") == spec.get(
+            "ref", alloc.get("tier_patterns_ref")):
+        print(f"[steward] tier_patterns already matches {args.patterns_spec} — no change")
+        return 0
+    print(f"[steward] propose tier_patterns change ({args.patterns_spec}):")
+    for tier in sorted(set(old_patterns) | set(new_patterns)):
+        o, n = old_patterns.get(tier, []), new_patterns.get(tier, [])
+        if o != n:
+            print(f"  {tier}: {o} -> {n}")
+    if not args.apply:
+        print("[steward] propose mode: nothing changed — re-run with --apply")
+        return 0
+    alloc.setdefault("tier_patterns_history", []).append({
+        "at": alloc_mod.now_iso(), "patterns": old_patterns,
+        "reason": spec.get("reason", f"pattern change via {args.patterns_spec}"),
+    })
+    alloc["tier_patterns"] = new_patterns
+    if spec.get("ref"):
+        alloc["tier_patterns_ref"] = spec["ref"]
+    alloc_mod.write_allocation(alloc, path)
+    print(f"[steward] applied tier_patterns change to {path} (old table "
+          f"snapshotted to tier_patterns_history — past ledger rows are "
+          f"still judged against the table of their own day)")
+    return 0
+
+
 def cmd_allocate(args):
     if args.action == "rubric":
         print(alloc_mod.RUBRIC)
@@ -2095,6 +2174,8 @@ def cmd_allocate(args):
                   file=sys.stderr)
             return 1
         alloc = alloc_mod.load_allocation(path)
+        if args.patterns_spec:
+            return cmd_allocate_tune_patterns(args, alloc, path)
         sdir = find_state_dir(args.state_dir)
         entries = alloc_mod.read_ledger(sdir, project=args.project)
         if not entries:
@@ -2553,6 +2634,12 @@ def main():
                           "printed but left untouched)")
     alp.add_argument("--project", help="tune: filter ledger entries by project")
     alp.add_argument("--state-dir")
+    alp.add_argument("--patterns-spec",
+                     help="tune: propose/apply a `tier_patterns` table change from "
+                          "a spec file ({patterns: {tier: [glob,...]}, reason, "
+                          "ref}) instead of the usual task-tier tuning pass — the "
+                          "pattern-level counterpart of a tier proposal, so the "
+                          "table is never hand-edited (T-20260901-109/118)")
 
     ip = sub.add_parser("init", help="print the manifest-authoring rubric; "
                                      "--out also writes a skeleton (V4 cold start)")
