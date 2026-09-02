@@ -711,6 +711,34 @@ def test_log_task_rejects_tier_model_mismatch(tmp_path):
     assert len(lines) == 1  # only the matching entry landed
 
 
+def test_log_task_tier_model_guard_walks_up_for_allocation_file(tmp_path):
+    """T-20260901-123: guard 2 must find `.allocation.yaml` the same way from
+    repo root and from a subdirectory two levels deep — before the fix,
+    `os.path.exists(".allocation.yaml")` only ever saw the exact cwd, so a
+    contradictory tier/model pair written from a subdirectory (no --allocation
+    given) silently skipped the guard and landed in the ledger unrejected."""
+    from agent_steward import allocate as am
+    alloc = am.build_allocation({"tasks": [axes_task("condense", "med", "med", "med")]})
+    am.write_allocation(alloc, str(tmp_path / ".allocation.yaml"))
+    deep = tmp_path / "sub" / "deep"
+    deep.mkdir(parents=True)
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    ledger = tmp_path / ".steward" / "usage_ledger.jsonl"
+    base = [sys.executable, "-m", "agent_steward.cli", "log-task",
+            "--task", "condense", "--model", "claude-sonnet-5", "--tier", "top",
+            "--state-dir", str(tmp_path / ".steward")]
+    # no --allocation given in either case: the guard must resolve
+    # `.allocation.yaml` by walking up from cwd, not by a bare relative name.
+    r_root = subprocess.run(base, capture_output=True, text=True, env=env, cwd=str(tmp_path))
+    assert r_root.returncode == 1, r_root.stdout + r_root.stderr
+    assert "REJECTED" in r_root.stderr
+    assert not ledger.exists()
+    r_deep = subprocess.run(base, capture_output=True, text=True, env=env, cwd=str(deep))
+    assert r_deep.returncode == 1, r_deep.stdout + r_deep.stderr  # was 0 pre-fix
+    assert "REJECTED" in r_deep.stderr
+    assert not ledger.exists()  # nothing written from either directory
+
+
 def test_log_task_unknown_model_still_warns_and_appends(tmp_path):
     """Unknown models (match no tier_patterns entry at all) stay warn-only —
     rejecting would block every legitimate new model name on day one."""
@@ -1577,6 +1605,39 @@ def test_find_state_dir_stops_at_git_boundary(tmp_path):
 def test_find_state_dir_falls_back_to_cwd_when_none_exists(tmp_path):
     (tmp_path / ".git").mkdir()
     assert cli.find_state_dir(None, str(tmp_path)) == str(tmp_path / ".steward")
+
+
+def test_find_allocation_file_walks_up_to_nearest_existing(tmp_path):
+    """T-20260901-123: mirrors test_find_state_dir_walks_up_to_nearest_existing
+    — guard 2 must find `.allocation.yaml` from a subdirectory the same way
+    find_state_dir already finds `.steward/`."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".allocation.yaml").write_text("tasks: {}\n")
+    deep = tmp_path / "src" / "pkg"
+    deep.mkdir(parents=True)
+    assert cli.find_allocation_file(None, str(deep)) == str(tmp_path / ".allocation.yaml")
+
+
+def test_find_allocation_file_explicit_wins(tmp_path):
+    (tmp_path / ".allocation.yaml").write_text("tasks: {}\n")
+    explicit = tmp_path / "elsewhere.yaml"
+    assert cli.find_allocation_file(str(explicit), str(tmp_path)) == str(explicit)
+
+
+def test_find_allocation_file_stops_at_git_boundary(tmp_path):
+    """A nested repo must not read its parent's allocation table."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".allocation.yaml").write_text("tasks: {}\n")
+    nested = tmp_path / "vendor" / "other-repo"
+    (nested / ".git").mkdir(parents=True)
+    work = nested / "src"
+    work.mkdir()
+    assert cli.find_allocation_file(None, str(work)) == str(work / ".allocation.yaml")
+
+
+def test_find_allocation_file_falls_back_to_cwd_when_none_exists(tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert cli.find_allocation_file(None, str(tmp_path)) == str(tmp_path / ".allocation.yaml")
 
 
 def test_log_task_from_subdir_appends_to_the_repo_ledger(tmp_path):

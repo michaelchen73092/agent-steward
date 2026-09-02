@@ -102,6 +102,51 @@ def find_state_dir(explicit=None, start=None):
     return os.path.abspath(os.path.join(base, STATE_DIR_DEFAULT))
 
 
+ALLOCATION_FILE_DEFAULT = ".allocation.yaml"
+
+
+def find_allocation_file(explicit=None, start=None):
+    """Resolve `.allocation.yaml` the same way `find_state_dir` resolves
+    `.steward/`: an explicit --allocation always wins; otherwise walk up
+    from `start` (default cwd) for the NEAREST existing file, stopping after
+    the directory that holds `.git` (a repo boundary) or at $HOME / the
+    filesystem root.
+
+    Why this exists (T-20260901-123): guard 2 in `cmd_log_task` used a bare
+    `args.allocation or ".allocation.yaml"` — a plain cwd-relative string.
+    `find_state_dir` already had to solve this exact problem for `.steward/`
+    (see its docstring); `.allocation.yaml` never got the same treatment, so
+    running `log-task` one directory below repo root made `os.path.exists()`
+    silently miss the real file and guard 2 no-op'd — no error, no warning,
+    just a contradictory tier/model pair written straight through.
+
+    Fail-open: any OS error, or no match found anywhere up to the boundary,
+    falls back to `<base>/.allocation.yaml` (mirrors find_state_dir's
+    fallback) — callers still `os.path.exists()` the result before trusting
+    it, so a genuine "this project has no allocation file at all" stays
+    silent, not a bypass.
+    """
+    if explicit:
+        return explicit
+    base = start or os.getcwd()
+    try:
+        cur = os.path.abspath(base)
+        home = os.path.abspath(os.path.expanduser("~"))
+        while True:
+            cand = os.path.join(cur, ALLOCATION_FILE_DEFAULT)
+            if os.path.isfile(cand):
+                return cand
+            if os.path.isdir(os.path.join(cur, ".git")) or cur == home:
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    except OSError:
+        pass
+    return os.path.abspath(os.path.join(base, ALLOCATION_FILE_DEFAULT))
+
+
 # ---------------------------------------------------------------- helpers
 
 def now_iso():
@@ -1470,7 +1515,7 @@ def cmd_log_task(args):
     # REJECTED (nothing written), not merely warned. Unknown models (match no
     # tier at all) stay warn-only: rejecting those would block every
     # legitimate new model name on day one.
-    apath = args.allocation or ".allocation.yaml"
+    apath = find_allocation_file(args.allocation)
     if entry.get("model") and entry.get("tier") and os.path.exists(apath):
         try:
             alloc = alloc_mod.load_allocation(apath)
