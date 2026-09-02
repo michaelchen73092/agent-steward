@@ -615,6 +615,63 @@ def test_allocation_compliance_transition_semantics(tmp_path):
     assert r["n_violations"] == 1 and "never-ok.md" in r["violations"][0]
 
 
+def test_allocation_compliance_uses_tier_patterns_of_the_stamps_day(tmp_path):
+    """T-20260901-155: the model globs are time-dependent, not just the tiers.
+
+    When a target split `mid: ['*opus*']` into `mid: ['*opus-4*']` /
+    `top: ['*opus-5*']` (T-20260901-109/118), 48 stamps that were compliant
+    under the table of their own day became violations against today's table
+    -- a permanent red nobody could ever clear, which is precisely what
+    `tier_patterns_history` / `allocate.patterns_at` exist to prevent. The
+    ledger side (`ledger_mismatches`) already replayed that history; this
+    probe judged every historical stamp against today's globs.
+    """
+    alloc = {"tasks": [{"id": "condense", "tier": "mid"}],
+             "tier_patterns": {"cheap": ["*haiku*"],
+                               "mid": ["*sonnet*", "*opus-4*"],
+                               "top": ["*fable*", "*opus-5*"]},
+             "tier_patterns_history": [
+                 {"at": "2026-09-01T21:57:09",
+                  "patterns": {"cheap": ["*haiku*"],
+                               "mid": ["*sonnet*", "*opus*"],
+                               "top": ["*fable*"]},
+                  "reason": "split opus-5 out of the generic *opus* glob"}]}
+    write(tmp_path, ".allocation.yaml", yaml.safe_dump(alloc))
+    write(tmp_path, "facts/x/before-split.md",      # compliant under its own day
+          "---\nid: F1\nproduced_by: claude-opus-5\ntask: condense\n"
+          "stamped_at: \"2026-09-01T05:30:00\"\n---\nb\n")
+    write(tmp_path, "facts/x/after-split.md",       # a genuinely new offender
+          "---\nid: F2\nproduced_by: claude-opus-5\ntask: condense\n"
+          "stamped_at: \"2026-09-02T01:00:00\"\n---\nb\n")
+    write(tmp_path, "facts/x/undated.md",           # no stamped_at -> today's table
+          "---\nid: F3\nproduced_by: claude-opus-5\ntask: condense\n---\nb\n")
+    write(tmp_path, "facts/x/wrong-both.md",        # in neither table's mid tier
+          "---\nid: F4\nproduced_by: claude-haiku-4-5\ntask: condense\n"
+          "stamped_at: \"2026-09-01T05:30:00\"\n---\nb\n")
+    spec = {"id": "p", "type": "allocation_compliance", "glob": "facts/**/*.md",
+            "allocation_file": ".allocation.yaml", "severity": "warn"}
+    r = cli.probe_allocation_compliance(str(tmp_path), spec)
+    joined = "\n".join(r["violations"])
+    assert "before-split.md" not in joined, joined
+    assert "after-split.md" in joined       # the real new offender is still caught
+    assert "undated.md" in joined           # undatable stamp -> today's rules apply
+    assert "wrong-both.md" in joined
+    assert r["n_violations"] == 3, joined
+    # a stamp that matches neither era says so, instead of implying the
+    # current table was the only one ever consulted
+    assert "tier_patterns also differed at stamp time" in \
+        next(v for v in r["violations"] if "wrong-both.md" in v)
+
+    # negative control: without the history the pre-split stamp goes red again.
+    # Without this the assertions above cannot tell "the fix works" from "this
+    # fixture never had a violation to begin with".
+    del alloc["tier_patterns_history"]
+    write(tmp_path, ".allocation.yaml", yaml.safe_dump(alloc))
+    r2 = cli.probe_allocation_compliance(str(tmp_path), spec)
+    assert r2["n_violations"] == 4
+    assert "before-split.md" in "\n".join(r2["violations"])
+
+
 def test_route_false_probes_stay_out_of_queue():
     mf = {"probes": [
         {"id": "lint", "type": "cmd", "route": False},

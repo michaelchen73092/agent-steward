@@ -712,9 +712,11 @@ def probe_allocation_compliance(root, spec):
     `tier_patterns: {tier: [glob, ...]}` maps tiers to model-name patterns —
     supplied by the manifest/allocation file, never hardcoded in the engine.
     Stamps carrying `stamped_at` are compared against the tier the allocation
-    HISTORY records for that moment, not today's table.
+    HISTORY records for that moment, AND against the `tier_patterns` that were
+    in force then (`tier_patterns_history`, replayed by
+    `allocate.patterns_at`) -- not today's table on either axis.
     Unstamped files are counted, not flagged (stamping adoption is gradual)."""
-    table, tier_patterns, history = {}, {}, []
+    table, history, alloc = {}, [], {}
     alloc_rel = spec.get("allocation_file")
     if alloc_rel:
         ap = alloc_rel if os.path.isabs(alloc_rel) else os.path.join(root, alloc_rel)
@@ -728,11 +730,32 @@ def probe_allocation_compliance(root, spec):
             for t in alloc.get("tasks", []) or []:
                 if isinstance(t, dict) and "id" in t and "tier" in t:
                     table[str(t["id"])] = str(t["tier"])
-            tier_patterns.update(alloc.get("tier_patterns") or {})
             history = alloc.get("history") or []
     for k, v in (spec.get("tasks") or {}).items():
         table[str(k)] = str(v)
-    tier_patterns.update(spec.get("tier_patterns") or {})
+
+    # `tier_patterns` is time-dependent in exactly the same way the task->tier
+    # table already is (`_tier_at` below): restructuring the model globs must
+    # not retroactively convict work that matched the table of its own day.
+    # `allocate.patterns_at()` replays `tier_patterns_history` and is what the
+    # ledger side (`allocate.ledger_mismatches`) has always used; this probe
+    # judged every historical stamp against TODAY's table, so the moment
+    # ai-industry-research split `*opus*` into `mid: *opus-4*` / `top: *opus-5*`
+    # (T-20260901-109/118) 48 already-compliant stamps turned into violations
+    # nobody could ever clear -- a permanent red that hides the next real one.
+    # The manifest's own inline `tier_patterns` still overrides, as before.
+    spec_patterns = spec.get("tier_patterns") or {}
+    _pat_cache = {}
+
+    def patterns_for(when):
+        key = str(when or "")
+        if key not in _pat_cache:
+            pats = dict(alloc_mod.patterns_at(alloc, when) or {})
+            pats.update(spec_patterns)
+            _pat_cache[key] = pats
+        return _pat_cache[key]
+
+    tier_patterns = patterns_for(None)      # today's effective table
     if not table:
         return result(spec, "allocation_compliance", "skipped",
                       "no allocation table (allocation_file missing and no inline tasks)")
@@ -763,10 +786,19 @@ def probe_allocation_compliance(root, spec):
         # matched the table of ITS day stays compliant after a promote, and
         # early adoption that the table later ratified is not retroactively
         # guilty — only a stamp matching NEITHER tier is a real violation
-        then = _tier_at(history, task, fm.get("stamped_at"), table[task])
+        stamped_at = fm.get("stamped_at")
+        then = _tier_at(history, task, stamped_at, table[task])
+        then_pats = patterns_for(stamped_at)
+        # each side is judged against a table that was internally consistent:
+        # (tier of its day, globs of its day) OR (tier today, globs today).
+        # An undated stamp (`stamped_at` missing) has only today's rules to be
+        # judged by -- same fallback `_tier_at` already takes.
+        cands = [(then, then_pats)]
+        if (table[task], tier_patterns) != cands[0]:
+            cands.append((table[task], tier_patterns))
         ok, missing = False, []
-        for tier in dict.fromkeys((then, table[task])):
-            pats = tier_patterns.get(tier)
+        for tier, pats_map in cands:
+            pats = pats_map.get(tier)
             if not pats:
                 missing.append(tier)
                 continue
@@ -774,13 +806,17 @@ def probe_allocation_compliance(root, spec):
                 ok = True
                 break
         if missing and not ok:
-            bad.append(f"{rel}: no tier_patterns entry for tier(s) {missing}")
+            bad.append(f"{rel}: no tier_patterns entry for tier(s) "
+                       f"{list(dict.fromkeys(missing))}")
             continue
         if not ok:
             span = (f"'{then}' at stamp time / '{table[task]}' now"
                     if then != table[task] else f"'{table[task]}'")
+            era = "" if then_pats == tier_patterns else (
+                " (tier_patterns also differed at stamp time; neither table "
+                "puts this model in that tier)")
             bad.append(f"{rel}: task '{task}' declared tier {span}, "
-                       f"got produced_by='{model}'")
+                       f"got produced_by='{model}'{era}")
     return result(spec, "allocation_compliance",
                   "pass" if not bad else spec.get("severity", "warn"),
                   f"table={len(table)} tasks, stamped={n}, unstamped={unstamped}",

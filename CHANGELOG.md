@@ -3,6 +3,34 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.28.0 — 2026-09-02
+- Fix (T-20260901-155): **`allocation_compliance` judged every historical
+  provenance stamp against TODAY's `tier_patterns`.** The tier a task is
+  assigned to was already replayed through allocation `history` (`_tier_at`),
+  and the ledger side already replayed the *glob table* through
+  `tier_patterns_history` (`allocate.patterns_at`) — but this probe never did,
+  so the two halves of the same package answered "should the past be
+  re-judged?" in opposite directions. The moment a target split
+  `mid: ['*opus*']` into `mid: ['*opus-4*'] / top: ['*opus-5*']`, 48 stamps
+  that were compliant under the table of their own day turned into violations
+  no one could ever clear — a permanent red that buries the next real one.
+  The probe now resolves the globs per stamp via `patterns_at(alloc,
+  stamped_at)`: a stamp passes if it was compliant under the rules of its own
+  day (tier-then + globs-then) **or** under today's (tier-now + globs-now).
+  Undated stamps (no `stamped_at`) keep being judged by today's table — the
+  same fallback `_tier_at` takes; there is nothing to date them by. Violation
+  text now says when the glob table also differed at stamp time, so a red is
+  never silently attributed to the current table alone. Manifest-inline
+  `tier_patterns` still override the allocation file, unchanged.
+- Landed (T-20260901-118): `allocate.classify_model()` resolves a model name
+  to one tier by longest-glob-wins; `log-task` guard 2 now REJECTs (writes
+  nothing) a model matching **no** tier pattern or matching two tiers at equal
+  specificity, instead of warning-and-writing, and echoes
+  `tier_patterns_ref` so the first collision has somewhere to go.
+- Landed (T-20260901-125): `write_allocation()` folds forward free-standing
+  comment blocks found in an existing `.allocation.yaml` (`yaml.safe_load`
+  drops comments on read; `safe_dump` used to lose them silently on write).
+
 ## 0.27.1 — 2026-09-01
 - Fix (T-20260901-123): **`log-task` guard 2 (tier/model SSoT) silently
   no-op'd when run one directory below repo root.** `apath = args.allocation
