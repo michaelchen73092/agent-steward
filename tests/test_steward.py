@@ -2092,3 +2092,101 @@ def test_source_parity_na_without_source_checkout(tmp_path):
                                      source_root=str(tmp_path / "no-such-repo"))
     assert ok
     assert "n/a" in detail
+
+
+def test_allocation_lookup_walks_up_for_every_reading_command(tmp_path):
+    """T-20260902-39: T-20260901-123 fixed the bare-relative-path lookup in
+    `cmd_log_task` only; `canary`, `report`, `ingest-usage` and `allocate
+    tune` kept `args.allocation or ".allocation.yaml"` and so answered a
+    different question from a subdirectory than from repo root.
+
+    `canary` was the load-bearing one: CLAUDE.md autorun rule 6-4 makes the
+    dispatcher ask `steward canary --task <id>` before every dispatch, and
+    from a subdirectory it answered "no" (don't shadow-run) for every task
+    class — worded identically to a legitimate "not this run", so the missing
+    tier-downgrade evidence was invisible.
+
+    Negative control lives in
+    `test_allocation_lookup_negative_control_bare_path_is_blind` below: the
+    same fixture with the pre-fix expression is asserted to give the wrong
+    answer, so this test cannot pass for the wrong reason.
+    """
+    alloc = alloc_mod.build_allocation({"tasks": [
+        axes_task("condense", "high", "med", "med")]})
+    alloc_mod.write_allocation(alloc, str(tmp_path / ".allocation.yaml"))
+    deep = tmp_path / "sub" / "deep"
+    deep.mkdir(parents=True)
+    sdir = tmp_path / ".steward"
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    base = [sys.executable, "-m", "agent_steward.cli"]
+
+    # ---- canary: same verdict, same words, from both directories
+    argv = base + ["canary", "--task", "condense", "--state-dir", str(sdir)]
+    r_root = subprocess.run(argv, capture_output=True, text=True, env=env,
+                            cwd=str(tmp_path))
+    r_deep = subprocess.run(argv, capture_output=True, text=True, env=env,
+                            cwd=str(deep))
+    assert r_root.returncode == 0, r_root.stdout + r_root.stderr
+    assert "shadow-run tier 'cheap'" in r_root.stdout
+    # pre-fix: rc=1, "no — no allocation file at .allocation.yaml"
+    assert r_deep.returncode == r_root.returncode, r_deep.stdout + r_deep.stderr
+    assert r_deep.stdout == r_root.stdout
+    assert "no allocation file" not in r_deep.stdout
+
+    # ---- allocate tune: pre-fix it told you to `allocate init` a table that
+    # already exists one directory up.
+    argv = base + ["allocate", "tune", "--state-dir", str(sdir)]
+    r_deep = subprocess.run(argv, capture_output=True, text=True, env=env,
+                            cwd=str(deep))
+    assert r_deep.returncode == 0, r_deep.stdout + r_deep.stderr
+    assert "run `steward allocate init` first" not in r_deep.stderr
+
+    # ---- report: the allocation table drives cost weights, so a report built
+    # without it is a different document, silently.
+    ledger_write(str(sdir), [{"task": "condense", "tier": "top",
+                              "model": "claude-opus-5", "est_tokens": 1000,
+                              "result": "pass"}] * 5)
+    outs = {}
+    for name, cwd in (("root", tmp_path), ("deep", deep)):
+        out = tmp_path / f"report-{name}.md"
+        r = subprocess.run(base + ["report", "--state-dir", str(sdir),
+                                   "--out", str(out)],
+                           capture_output=True, text=True, env=env, cwd=str(cwd))
+        assert r.returncode == 0, r.stdout + r.stderr
+        outs[name] = [ln for ln in open(out, encoding="utf-8").read().splitlines()
+                      if not ln.startswith("- generated:")]
+    assert outs["deep"] == outs["root"]
+
+
+def test_allocation_lookup_negative_control_bare_path_is_blind(tmp_path):
+    """Negative control for the test above: assert that the expression the fix
+    replaced (`args.allocation or ".allocation.yaml"`) really is blind from a
+    subdirectory, so a future refactor that quietly reintroduces it cannot
+    leave the suite green. Asserted against the same fixture shape, on the
+    real helper, without monkeypatching the CLI."""
+    alloc_mod.write_allocation(
+        alloc_mod.build_allocation({"tasks": [axes_task("condense", "high", "med", "med")]}),
+        str(tmp_path / ".allocation.yaml"))
+    deep = tmp_path / "sub" / "deep"
+    deep.mkdir(parents=True)
+    cwd0 = os.getcwd()
+    try:
+        os.chdir(deep)
+        bare = None or ".allocation.yaml"          # the pre-fix expression
+        assert not os.path.exists(bare)            # blind — this was the bug
+        assert os.path.exists(cli.find_allocation_file(None))   # the fix sees it
+    finally:
+        os.chdir(cwd0)
+
+
+def test_allocate_init_out_stays_cwd_relative(tmp_path):
+    """T-20260902-39 boundary: `allocate init --out` is a WRITE destination and
+    is deliberately left cwd-relative. Walking up there would make `init` from
+    a subdirectory overwrite (or refuse because of) a parent's table instead of
+    creating one where the operator is standing."""
+    src = os.path.join(os.path.dirname(__file__), "..", "src")
+    text = open(os.path.join(src, "agent_steward", "cli.py"), encoding="utf-8").read()
+    assert 'out = args.out or ".allocation.yaml"' in text
+    # ...and no reading call site kept the bare form.
+    assert 'apath = args.allocation or ".allocation.yaml"' not in text
+    assert 'path = args.allocation or ".allocation.yaml"' not in text

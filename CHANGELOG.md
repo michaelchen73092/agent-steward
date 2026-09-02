@@ -3,6 +3,35 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.29.0 — 2026-09-02
+- Fix (T-20260902-39): **the `.allocation.yaml` lookup was fixed in one call
+  site out of five.** 0.27.1 (T-20260901-123) gave `cmd_log_task` a
+  `find_allocation_file()` that walks up to the repo root; `cmd_canary`,
+  `cmd_report`, `cmd_ingest_usage` and `allocate tune` all kept the bare
+  cwd-relative `args.allocation or ".allocation.yaml"` and so answered a
+  different question depending on which directory you stood in.
+  `canary` was the load-bearing one: CLAUDE.md autorun rule 6-4 has the
+  dispatcher ask `steward canary --task <id>` before every dispatch, and from
+  a subdirectory it answered `no — no allocation file at .allocation.yaml`
+  for **every** task class. That wording is not distinguishable at the caller
+  from a legitimate "counter says not this run", so the tier-downgrade
+  evidence those shadow runs exist to collect was simply never gathered, with
+  nothing anywhere going red. Measured on this machine, same table, same
+  minute: repo root said `yes — shadow-run tier 'cheap' (primary run #160,
+  canary every 5)` rc=0; one directory down said `no` rc=1.
+  `report` was quieter and worse: run from a subdirectory it dropped every
+  allocation-derived section and printed `What needs you: (nothing — no rule
+  problems, no pending proposals, an empty queue. Enjoy it.)` while the same
+  command at repo root listed three pending tier-change proposals; headline
+  savings read 60.1% instead of 50.6% (135 diff lines between the two).
+  All four reading call sites now go through `find_allocation_file()`.
+  `allocate init --out` is deliberately left cwd-relative and is covered by
+  its own test: it is a write destination, and creating the table is the one
+  operation that must land where the operator is standing.
+- Note: `allocate tune` was a fifth instance the reporting card did not list.
+  It was found by grepping the *shape* rather than the reported line — which
+  is the same lesson 0.27.1 missed.
+
 ## 0.28.0 — 2026-09-02
 - Fix (T-20260901-155): **`allocation_compliance` judged every historical
   provenance stamp against TODAY's `tier_patterns`.** The tier a task is

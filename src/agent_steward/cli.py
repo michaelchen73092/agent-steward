@@ -1973,7 +1973,10 @@ def cmd_ingest_usage(args):
                   f"`steward log-task`")
             return 0
     alloc = None
-    apath = args.allocation or ".allocation.yaml"
+    # T-20260902-39: walk up like `find_state_dir` — a bare ".allocation.yaml"
+    # only ever matched the exact cwd, so ingesting from a subdirectory
+    # silently ran with no allocation table (unattributed tiers).
+    apath = find_allocation_file(args.allocation)
     if os.path.exists(apath):
         try:
             alloc = alloc_mod.load_allocation(apath)
@@ -2021,7 +2024,13 @@ def cmd_canary(args):
     the ledger, no randomness — auditable and replayable). Exit 0 = canary
     this run (shadow tier printed); exit 1 = don't. Any problem = don't
     canary (fail-open: the steward must never block the pipeline)."""
-    apath = args.allocation or ".allocation.yaml"
+    # T-20260902-39: the bare relative name made this the loudest instance of
+    # the T-20260901-123 bug — dispatched from any subdirectory, canary
+    # answered "no" (don't shadow-run) for every task class, and "no because
+    # I could not find the table" is indistinguishable from "no because the
+    # counter says not this run" at the caller. Policy fail-open: the shadow
+    # runs that feed tier-downgrade evidence were never dispatched.
+    apath = find_allocation_file(args.allocation)
     if not os.path.exists(apath):
         print(f"[steward] canary: no — no allocation file at {apath}")
         return 1
@@ -2207,7 +2216,12 @@ def cmd_allocate(args):
               f"{alloc_mod.RUBRIC_VERSION}); no human wrote this table")
         return 0
     if args.action == "tune":
-        path = args.allocation or ".allocation.yaml"
+        # T-20260902-39: same shape as the three the card named — `tune` run
+        # from a subdirectory told you to `allocate init` a table that already
+        # exists one level up. (`init`'s --out below is deliberately NOT
+        # walked up: it is a write destination, and creating the table is the
+        # one operation that must land where you are standing.)
+        path = find_allocation_file(args.allocation)
         if not os.path.exists(path):
             print(f"[steward] no allocation file at {path} — run `steward allocate init` first",
                   file=sys.stderr)
@@ -2278,7 +2292,11 @@ def cmd_report(args):
     trade-offs, coverage, rule problems."""
     sdir = find_state_dir(args.state_dir)
     alloc = None
-    apath = args.allocation or ".allocation.yaml"
+    # T-20260902-39: without this, `steward report` from a subdirectory
+    # silently dropped every allocation-derived section — the "What needs you"
+    # queue printed "nothing … Enjoy it." while the same command at repo root
+    # listed three pending tier-change proposals.
+    apath = find_allocation_file(args.allocation)
     if os.path.exists(apath):
         alloc = alloc_mod.load_allocation(apath)
     since = _parse_when_arg(args.since, "since")
@@ -2654,7 +2672,8 @@ def main():
                     help="shadow entry only: adjudicated quality vs the primary")
     lp.add_argument("--allocation",
                     help="allocation file used to warn on tier/model mismatch "
-                         "(default: ./.allocation.yaml if present)")
+                         "(default: nearest .allocation.yaml, walking up "
+                         "from cwd to the repo root)")
     lp.add_argument("--state-dir",
                     help=f"where usage_ledger.jsonl lives (default: nearest "
                          f"{STATE_DIR_DEFAULT}/ walking up from cwd, else ./{STATE_DIR_DEFAULT})")
@@ -2665,7 +2684,8 @@ def main():
     alp.add_argument("--axes", help="axes.yaml produced by an agent following the rubric")
     alp.add_argument("--out", help="init: where to write (default: ./.allocation.yaml)")
     alp.add_argument("--force", action="store_true", help="init: overwrite existing file")
-    alp.add_argument("--allocation", help="tune: allocation file (default: ./.allocation.yaml)")
+    alp.add_argument("--allocation", help="tune: allocation file (default: nearest "
+                                          ".allocation.yaml, walking up from cwd)")
     alp.add_argument("--apply", action="store_true",
                      help="tune: apply proposals (default: propose only)")
     alp.add_argument("--only",
@@ -2738,7 +2758,8 @@ def main():
     ing.add_argument("--session-task", default="_session",
                      help="task id for main-session (non-worker) usage")
     ing.add_argument("--allocation", help="for tier lookup via tier_patterns "
-                                          "(default: ./.allocation.yaml)")
+                                          "(default: nearest .allocation.yaml, "
+                                          "walking up from cwd)")
     ing.add_argument("--project")
     ing.add_argument("--dry-run", action="store_true",
                      help="show what would be appended, touch nothing")
@@ -2749,7 +2770,8 @@ def main():
                          help="should this run shadow-run one tier lower? "
                               "exit 0 = yes (R3 loop two)")
     cnp.add_argument("--task", required=True, help="task class id")
-    cnp.add_argument("--allocation", help="default: ./.allocation.yaml")
+    cnp.add_argument("--allocation", help="default: nearest .allocation.yaml, "
+                                          "walking up from cwd")
     cnp.add_argument("--project", help="filter ledger entries by project")
     cnp.add_argument("--state-dir")
 
