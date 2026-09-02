@@ -3,6 +3,20 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.27.1 — 2026-09-01
+- Fix (T-20260901-123): **`log-task` guard 2 (tier/model SSoT) silently
+  no-op'd when run one directory below repo root.** `apath = args.allocation
+  or ".allocation.yaml"` was a bare cwd-relative string — `find_state_dir()`
+  already had to walk up for `.steward/` for the exact same reason (see its
+  docstring), but `.allocation.yaml` never got the same treatment. A
+  contradictory `--tier`/`--model` pair run from a subdirectory landed in the
+  ledger unrejected instead of failing with `REJECTED` (7 real rows written
+  this way after the guard shipped in 0.27.0). Added `find_allocation_file()`
+  mirroring `find_state_dir`'s walk-up (nearest existing file, stop at `.git`
+  boundary or `$HOME`) and wired it into guard 2 only — guard 1 (dedup) and
+  the other three `.allocation.yaml` lookups (canary/tune/etc.) are untouched,
+  out of scope for this fix.
+
 ## 0.27.0 — 2026-08-24
 - Fix (T-20260824-91, E-21 下沉條款②): **`log-task` had zero write-time
   guards.** A worker re-running `log-task` for a card already logged by its
