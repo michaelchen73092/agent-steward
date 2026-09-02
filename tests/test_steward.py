@@ -2190,3 +2190,89 @@ def test_allocate_init_out_stays_cwd_relative(tmp_path):
     # ...and no reading call site kept the bare form.
     assert 'apath = args.allocation or ".allocation.yaml"' not in text
     assert 'path = args.allocation or ".allocation.yaml"' not in text
+
+
+def test_allocate_tune_axes_spec_reassess_and_add(tmp_path):
+    """T-20260902-57 — the third table-change axis: the RATINGS were wrong.
+
+    `tune`'s promote path needs escalation evidence, so a class that runs at
+    the wrong tier and always passes (ai-industry-research's `daily_extraction`
+    / `daily_report_gen`: 30/30 produced by a top model, zero escalations) can
+    never be corrected by it, and `init --force` would discard `history`. This
+    asserts the spec carries axes only — the rubric matrix still derives the
+    tier — that propose changes nothing, that `--apply` records the move in
+    `history` (so `_tier_at` keeps judging past stamps by the table of their
+    own day), and that a task absent from the table is ADDED."""
+    from agent_steward import allocate as am
+    alloc = am.build_allocation({"tasks": [
+        axes_task("daily_report_gen", "med", "med", "high"),
+        axes_task("keep_me", "high", "low", "low")]})
+    apath = tmp_path / ".allocation.yaml"
+    am.write_allocation(alloc, str(apath))
+    before = {t["id"]: dict(t) for t in am.load_allocation(str(apath))["tasks"]}
+    assert before["daily_report_gen"]["tier"] == "mid"
+    spec = {"tasks": [
+        {"id": "daily_report_gen", "verifiable": "med", "judgment": "high",
+         "blast_radius": "high", "volume": "high",
+         "rationale": "runs inside the one /daily session that holds admission"},
+        {"id": "product_column_publish", "verifiable": "med", "judgment": "high",
+         "blast_radius": "high", "volume": "low", "rationale": "alias of product_column"}],
+        "reason": "T-20260902-57: declared tier and executed model permanently disagree",
+        "ref": "state/eng/diag/T-20260902-57-daily-lane-tier-contradiction.md"}
+    spath = tmp_path / "axes.yaml"
+    spath.write_text(yaml.safe_dump(spec), encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    base = [sys.executable, "-m", "agent_steward.cli", "allocate", "tune",
+            "--allocation", str(apath), "--axes-spec", str(spath)]
+    r_propose = subprocess.run(base, capture_output=True, text=True, env=env)
+    assert r_propose.returncode == 0, r_propose.stderr
+    assert "propose" in r_propose.stdout and "mid -> top" in r_propose.stdout
+    assert {t["id"]: dict(t) for t in am.load_allocation(str(apath))["tasks"]} == before
+    r_apply = subprocess.run(base + ["--apply"], capture_output=True, text=True, env=env)
+    assert r_apply.returncode == 0, r_apply.stderr
+    after = {t["id"]: t for t in am.load_allocation(str(apath))["tasks"]}
+    # tier came from the matrix (judgment=high -> top; blast=high -> floor top),
+    # never from the spec, which carries no tier at all
+    assert after["daily_report_gen"]["tier"] == "top"
+    assert after["daily_report_gen"]["floor"] == "top"
+    assert after["daily_report_gen"]["standardized"] is False
+    # a task the table had never heard of is added, not nagged about
+    assert after["product_column_publish"]["tier"] == "top"
+    # untouched rows stay byte-identical
+    assert dict(after["keep_me"]) == before["keep_me"]
+    hist = am.load_allocation(str(apath))["history"]
+    moved = [h for h in hist if h["task"] == "daily_report_gen"][-1]
+    assert moved["from"] == "mid" and moved["to"] == "top"
+    assert moved["axes_from"]["judgment"] == "med"
+    assert moved["axes_to"]["judgment"] == "high"
+    assert "T-20260902-57" in moved["reason"] and moved["ref"] == spec["ref"]
+    added = [h for h in hist if h["task"] == "product_column_publish"][-1]
+    assert added["from"] is None and added["axes_from"] is None
+    # re-running the same spec is a no-op, not a second history row
+    r_again = subprocess.run(base + ["--apply"], capture_output=True, text=True, env=env)
+    assert r_again.returncode == 0 and "already matches" in r_again.stdout
+    assert len(am.load_allocation(str(apath))["history"]) == len(hist)
+
+
+def test_allocate_tune_axes_spec_rejects_a_tier_smuggled_in(tmp_path):
+    """Negative control: the whole point is that a human never writes a tier.
+    A spec with a bad/missing axis is rejected outright (nonzero, no write)
+    rather than falling back to whatever the caller wanted."""
+    from agent_steward import allocate as am
+    alloc = am.build_allocation({"tasks": [axes_task("t1", "high", "low", "low")]})
+    apath = tmp_path / ".allocation.yaml"
+    am.write_allocation(alloc, str(apath))
+    before = apath.read_text(encoding="utf-8")
+    spath = tmp_path / "axes.yaml"
+    # `tier: top` is not an axis — with judgment missing, assess() must refuse
+    spath.write_text(yaml.safe_dump({"tasks": [
+        {"id": "t1", "tier": "top", "verifiable": "high",
+         "blast_radius": "low", "volume": "low"}]}), encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")}
+    r = subprocess.run([sys.executable, "-m", "agent_steward.cli", "allocate",
+                        "tune", "--allocation", str(apath), "--axes-spec",
+                        str(spath), "--apply"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode != 0
+    assert "judgment" in r.stderr
+    assert apath.read_text(encoding="utf-8") == before

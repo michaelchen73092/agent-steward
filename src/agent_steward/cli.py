@@ -2186,6 +2186,125 @@ def cmd_allocate_tune_patterns(args, alloc, path):
     return 0
 
 
+def cmd_allocate_tune_axes(args, alloc, path):
+    """`steward allocate tune --axes-spec SPEC.yaml [--apply]`.
+
+    T-20260902-57: the third table-change axis. `tune` (escalation rate /
+    canary) moves a tier when the WORK misbehaves; `--patterns-spec` moves the
+    model globs. Neither can express "the axes ratings themselves were wrong",
+    and that is the only defect some tables have: `daily_extraction` /
+    `daily_report_gen` were rated judgment=med in ai-industry-research and have
+    since been produced 30/30 times by a top-tier model, because they are not
+    separately dispatchable -- they are stamps on artifacts minted inside the
+    one `/daily` session that also holds `admission` (floor: top). No
+    escalation ever happens (the work passes), so `tune`'s promote path
+    (esc_rate >= promote_above) can never fire, and `allocate init --force` is
+    the only other route -- which discards `history` and
+    `tier_patterns_history`, i.e. the very record `patterns_at`/`_tier_at` need
+    to keep from convicting the past. So the table got hand-edited, which the
+    file header says it never should be.
+
+    This closes that gap the same way `--patterns-spec` closed the glob one:
+    the spec carries AXES, never tiers; `assess()` (the published rubric-v1
+    matrix) derives tier/floor/canary/escalate_on; the move is recorded in
+    `history` so `_tier_at` still judges every past stamp against the table of
+    its own day. Tasks absent from the table are ADDED -- the "recursive growth
+    path" that `tune` only ever printed a nag about.
+
+    SPEC file shape:
+        tasks:                               # required
+          - id: daily_report_gen
+            verifiable: med                  # all four axes required,
+            judgment: high                   # each low|med|high
+            blast_radius: high
+            volume: high
+            rationale: "..."                 # optional, replaces the row's
+        reason: "..."                        # optional, recorded in history
+        ref: "path/to/diagnosis.md"          # optional, recorded in history
+    """
+    with open(args.axes_spec, encoding="utf-8") as f:
+        spec = yaml.safe_load(f) or {}
+    tasks = spec.get("tasks")
+    if not tasks:
+        print(f"[steward] --axes-spec {args.axes_spec} has no `tasks:` key — "
+              f"nothing to propose", file=sys.stderr)
+        return 1
+    table = {t["id"]: t for t in alloc.get("tasks", []) if isinstance(t, dict)
+             and "id" in t}
+    changes = []
+    for t in tasks:
+        if not isinstance(t, dict) or "id" not in t:
+            print(f"[steward] --axes-spec {args.axes_spec}: every task needs an "
+                  f"`id` (got {t!r})", file=sys.stderr)
+            return 1
+        try:
+            derived = alloc_mod.assess(t)
+        except ValueError as e:
+            print(f"[steward] --axes-spec {args.axes_spec}: {e}", file=sys.stderr)
+            return 1
+        tid = str(t["id"])
+        old = table.get(tid)
+        new_axes = {k: str(t[k]) for k in alloc_mod.AXES}
+        old_axes = {k: str(v) for k, v in (old or {}).get("assessed", {}).items()}
+        if old is not None and old_axes == new_axes and all(
+                old.get(k) == v for k, v in derived.items()):
+            continue
+        changes.append({"id": tid, "old": old, "old_axes": old_axes,
+                        "new_axes": new_axes, "derived": derived,
+                        "rationale": t.get("rationale")})
+    if not changes:
+        print(f"[steward] every task in {args.axes_spec} already matches the "
+              f"table (axes and derived tier/floor/canary) — no change")
+        return 0
+    print(f"[steward] propose axes re-assessment ({args.axes_spec}); tiers are "
+          f"derived by the rubric {alloc_mod.RUBRIC_VERSION} matrix, not by the spec:")
+    for c in changes:
+        kind = "add" if c["old"] is None else "re-assess"
+        print(f"  {kind} '{c['id']}':")
+        for ax in alloc_mod.AXES:
+            o, n = c["old_axes"].get(ax), c["new_axes"][ax]
+            if o != n:
+                print(f"      {ax}: {o} -> {n}")
+        for k, v in c["derived"].items():
+            o = (c["old"] or {}).get(k)
+            if o != v:
+                print(f"      {k}: {o} -> {v}   (derived)")
+    if not args.apply:
+        print("[steward] propose mode: nothing changed — re-run with --apply")
+        return 0
+    reason = spec.get("reason", f"axes re-assessment via {args.axes_spec}")
+    ref = spec.get("ref")
+    for c in changes:
+        row = c["old"]
+        if row is None:
+            row = {"id": c["id"]}
+            alloc.setdefault("tasks", []).append(row)
+        from_tier = row.get("tier")
+        row["tier"] = c["derived"]["tier"]
+        row["floor"] = c["derived"]["floor"]
+        row["canary"] = c["derived"]["canary"]
+        row["escalate_on"] = c["derived"]["escalate_on"]
+        row["assessed"] = dict(c["new_axes"])
+        if c["rationale"] is not None:
+            row["rationale"] = c["rationale"]
+        # 2026-07-31 deterministic convention (T-20260730-63): a class is
+        # `standardized` iff it sits at the bottom tier, where the rubric bar
+        # for cheap dispatch has already been cleared. Re-derived rather than
+        # carried over: a row promoted off cheap is no longer proven at cheap.
+        row["standardized"] = (c["derived"]["tier"] == "cheap")
+        entry = {"at": alloc_mod.now_iso(), "task": c["id"], "from": from_tier,
+                 "to": c["derived"]["tier"], "reason": reason,
+                 "axes_from": c["old_axes"] or None, "axes_to": dict(c["new_axes"])}
+        if ref:
+            entry["ref"] = ref
+        alloc.setdefault("history", []).append(entry)
+    alloc_mod.write_allocation(alloc, path)
+    print(f"[steward] applied {len(changes)} axes re-assessment(s) to {path} "
+          f"(recorded in `history` — past stamps are still judged against the "
+          f"tier in force on their own day)")
+    return 0
+
+
 def cmd_allocate(args):
     if args.action == "rubric":
         print(alloc_mod.RUBRIC)
@@ -2229,6 +2348,8 @@ def cmd_allocate(args):
         alloc = alloc_mod.load_allocation(path)
         if args.patterns_spec:
             return cmd_allocate_tune_patterns(args, alloc, path)
+        if args.axes_spec:
+            return cmd_allocate_tune_axes(args, alloc, path)
         sdir = find_state_dir(args.state_dir)
         entries = alloc_mod.read_ledger(sdir, project=args.project)
         if not entries:
@@ -2693,6 +2814,15 @@ def main():
                           "printed but left untouched)")
     alp.add_argument("--project", help="tune: filter ledger entries by project")
     alp.add_argument("--state-dir")
+    alp.add_argument("--axes-spec",
+                     help="tune: propose/apply an AXES re-assessment from a spec "
+                          "file ({tasks: [{id, verifiable, judgment, "
+                          "blast_radius, volume, rationale}], reason, ref}) — "
+                          "tiers stay derived by the rubric matrix, and tasks "
+                          "absent from the table are added (the recursive "
+                          "growth path). Use when the ratings were wrong, not "
+                          "the work: escalation-rate tuning cannot promote a "
+                          "class that never escalates (T-20260902-57)")
     alp.add_argument("--patterns-spec",
                      help="tune: propose/apply a `tier_patterns` table change from "
                           "a spec file ({patterns: {tier: [glob,...]}, reason, "

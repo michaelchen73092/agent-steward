@@ -3,6 +3,31 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.30.0 — 2026-09-02
+- Feature (T-20260902-57): `steward allocate tune --axes-spec SPEC.yaml
+  [--apply]` — the third way a tier table legitimately changes. The existing
+  two both assume the ratings were right: escalation-rate/canary tuning moves a
+  tier when the WORK misbehaves, and `--patterns-spec` (0.28) moves the model
+  globs. Neither can say "the axes ratings themselves were wrong", and that was
+  the only defect in ai-industry-research's `daily_extraction` /
+  `daily_report_gen`: rated judgment=med, then produced 30/30 times by a
+  top-tier model, because they are not separately dispatchable — they are
+  stamps on artifacts minted inside the one `/daily` session that also holds
+  `admission` (floor: top). The work never escalates, so `tune`'s promote path
+  (`esc_rate >= promote_above`) could never fire; the only other route,
+  `allocate init --force`, discards `history` and `tier_patterns_history` —
+  exactly the record `_tier_at`/`patterns_at` need so that restructuring the
+  table never convicts the past. With no sanctioned path left, such tables get
+  hand-edited, which the generated file header says they never should be.
+  The spec carries AXES only (`verifiable`/`judgment`/`blast_radius`/`volume`);
+  `assess()` still derives tier/floor/canary/escalate_on from the published
+  rubric matrix, `standardized` is re-derived from the resulting tier per the
+  bottom-tier convention, and the move lands in `history` with `axes_from` /
+  `axes_to` / `ref`. Tasks absent from the table are ADDED — the "recursive
+  growth path" `tune` previously only printed a nag about. Propose by default,
+  `--apply` writes; an unchanged spec is a no-op, and a spec missing an axis is
+  rejected without touching the file.
+
 ## 0.29.0 — 2026-09-02
 - Fix (T-20260902-39): **the `.allocation.yaml` lookup was fixed in one call
   site out of five.** 0.27.1 (T-20260901-123) gave `cmd_log_task` a
