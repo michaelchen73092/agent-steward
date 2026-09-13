@@ -38,6 +38,7 @@ import fnmatch
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -1493,7 +1494,143 @@ def cmd_stamp(args):
 
 # ---------------------------------------------------------------- ledger (R1)
 
+_USAGE_FIELDS = frozenset(("input_tokens", "output_tokens", "cache_creation_input_tokens",
+                           "cache_read_input_tokens"))
+_USAGE_IDENTITIES = frozenset(("namespace", "attempt_id", "source_event_id", "segment_id"))
+_USAGE_STATES = frozenset(("complete", "missing", "namespace_missing", "persistence_failed",
+                          "context_conflict", "observation_time_invalid",
+                          "receipt_persistence_failed", "receipt_conflict", "adapter_error"))
+
+
+def _usage_require(ok):
+    if not ok:
+        raise ValueError("invalid usage-v2 schema or inconsistent measurement")
+
+
+def _usage_finite(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+    except (OverflowError, TypeError):
+        return False
+
+
+def _usage_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        _usage_require(key not in result)
+        result[key] = value
+    return result
+
+
+def _validate_usage_snapshot(value):
+    fields = {"quantities", "missing_quantities", "invalid_quantities", "usage_status",
+              "measurement_method", "aggregation", "reported_cost_usd", "cost_method",
+              "execution_status", "side_effect_status"}
+    _usage_require(isinstance(value, dict) and set(value) == fields)
+    quantities = value["quantities"]
+    _usage_require(isinstance(quantities, dict) and set(quantities) <= _USAGE_FIELDS)
+    _usage_require(all(_usage_finite(n) for n in quantities.values()))
+    for key in ("missing_quantities", "invalid_quantities"):
+        items = value[key]
+        _usage_require(isinstance(items, list) and all(isinstance(x, str) for x in items))
+        _usage_require(len(items) == len(set(items)) and set(items) <= _USAGE_FIELDS)
+    missing = set(value["missing_quantities"])
+    _usage_require(missing == _USAGE_FIELDS - set(quantities))
+    _usage_require(set(value["invalid_quantities"]) <= missing)
+    expected = ("partial" if missing else "observed") if quantities else "missing"
+    _usage_require(value["usage_status"] == expected)
+    _usage_require(value["reported_cost_usd"] is None or _usage_finite(value["reported_cost_usd"]))
+    for key in ("measurement_method", "aggregation", "cost_method"):
+        _usage_require(isinstance(value[key], str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value[key]))
+    _usage_require(value["execution_status"] in ("not_started", "timeout", "failed", "returned"))
+    _usage_require(value["side_effect_status"] in ("unresolved", "not_assessed"))
+    # Normalize set-valued lists without changing any measurement.
+    return dict(value, missing_quantities=sorted(missing),
+                invalid_quantities=sorted(value["invalid_quantities"]))
+
+
+def _parse_usage_v2(raw):
+    if raw is None:
+        return None
+    _usage_require(isinstance(raw, str) and len(raw.encode("utf-8")) <= 8192)
+    value = json.loads(raw, object_pairs_hook=_usage_pairs)
+    allowed = _USAGE_IDENTITIES | {"schema_version", "identity_status", "observed_epoch",
+                                   "usage", "cause_status", "outcome_status"}
+    _usage_require(isinstance(value, dict) and set(value) <= allowed)
+    _usage_require(type(value.get("schema_version")) is int and value["schema_version"] == 1)
+    _usage_require(isinstance(value.get("identity_status"), str) and value["identity_status"] in _USAGE_STATES)
+    _usage_require(value.get("cause_status") == "unknown" and value.get("outcome_status") == "unverified")
+    for key in _USAGE_IDENTITIES & set(value):
+        text = value[key]
+        _usage_require(isinstance(text, str) and (text == "" and key == "namespace" or
+                       re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", text)))
+    if "observed_epoch" in value:
+        _usage_require(_usage_finite(value["observed_epoch"]))
+    if value["identity_status"] == "complete":
+        _usage_require(all(value.get(k) for k in _USAGE_IDENTITIES) and "observed_epoch" in value)
+    if "usage" in value:
+        value["usage"] = _validate_usage_snapshot(value["usage"])
+    else:
+        _usage_require(value["identity_status"] == "adapter_error")
+    return value
+
+
+def _usage_key(entry):
+    value = entry.get("usage_v2")
+    if not isinstance(value, dict) or value.get("identity_status") != "complete":
+        return None
+    parts = tuple(value.get(k) for k in ("namespace", "source_event_id", "segment_id"))
+    return parts if all(isinstance(x, str) and x for x in parts) else None
+
+
+def _ledger_replay_status(path, entry):
+    """One existing scan under the ledger lock; conflicts take precedence over replay.
+
+    A canonical identity never falls back to a human note. Legacy rows cannot
+    be assigned an identity retroactively; their overlap remains unmeasured.
+    """
+    key, note = _usage_key(entry), entry.get("note")
+    if not os.path.exists(path) or (key is None and note is None):
+        return None
+    replay = False
+    immutable = {k: v for k, v in entry.items() if k not in ("ts", "note")}
+    with open(path, encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                prev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(prev, dict):
+                continue
+            if key is not None:
+                if _usage_key(prev) != key:
+                    continue
+                same = {k: v for k, v in prev.items() if k not in ("ts", "note")} == immutable
+                if not same:
+                    return 1
+                replay = True
+            elif prev.get("task") == entry["task"] and prev.get("note") == note:
+                # Legacy behavior remains; optional metadata must not hide conflicts.
+                if "usage_v2" in entry and prev.get("usage_v2") != entry["usage_v2"]:
+                    return 1
+                replay = True
+    return 0 if replay else None
+
+
 def cmd_log_task(args):
+    """Validate optional evidence, then serialize the existing scan and append."""
+    try:
+        usage = _parse_usage_v2(getattr(args, "usage_v2", None))
+    except (ValueError, TypeError, RecursionError):
+        print("[steward] REJECTED: invalid --usage-v2 evidence; nothing written", file=sys.stderr)
+        return 1
+    sdir = find_state_dir(args.state_dir)
+    os.makedirs(sdir, exist_ok=True)
+    with locked_state(os.path.join(sdir, "usage_ledger.jsonl")):
+        return _log_task_locked(args, sdir, usage)
+
+
+def _log_task_locked(args, sdir, usage):
     """Append one task to the usage ledger.
 
     `person_id` (via `--person`, T-20260814-120) is the *dispatcher-declared*
@@ -1508,8 +1645,6 @@ def cmd_log_task(args):
     anything is appended — the ledger is append-only and a bad row can never
     be taken back, so the only safe place to stop it is here.
     """
-    sdir = find_state_dir(args.state_dir)
-    os.makedirs(sdir, exist_ok=True)
     entry = {"ts": now_iso(), "task": args.task, "tier": args.tier}
     for k in ("model", "est_tokens", "result", "project", "note",
               "person_id", "canary", "pair", "quality"):
@@ -1522,31 +1657,13 @@ def cmd_log_task(args):
               file=sys.stderr)
     path = os.path.join(sdir, "usage_ledger.jsonl")
 
-    # ---- guard 1: write-time dedup on (task, note) ---------------------
-    # `--note` is the caller's dedup key (headless: `LOG_TASK_NOTE_FMT`
-    # "card=<tid> t=<ev_t>"; interactive: whatever the collector chooses).
-    # A worker that runs `log-task` itself when it was told not to (E-21,
-    # 2026-08-15) re-sends the *same* note the dispatcher already logged —
-    # that repeat must not become a second row. Entries with no `--note`
-    # carry no dedup signal and are always appended unchanged: dedup needs
-    # a key, not a guess at which rows "look" the same.
-    note = entry.get("note")
-    if note is not None and os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            for ln in f:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                try:
-                    prev = json.loads(ln)
-                except json.JSONDecodeError:
-                    continue
-                if prev.get("task") == entry["task"] and prev.get("note") == note:
-                    print(f"[steward] already logged at {prev.get('ts')} "
-                          f"(task={entry['task']!r} note={note!r}) — "
-                          f"skipping duplicate, ledger unchanged (idempotent)",
-                          file=sys.stderr)
-                    return 0
+    if usage is not None:
+        entry["usage_v2"] = usage
+    replay = _ledger_replay_status(path, entry)
+    if replay is not None:
+        message = "REJECTED: conflicting usage identity; nothing written" if replay else "already logged; skipping duplicate, ledger unchanged (idempotent)"
+        print(f"[steward] {message}", file=sys.stderr)
+        return replay
 
     # ---- guard 2: tier/model single SSoT ---------------------------------
     # `.allocation.yaml` `tier_patterns` is now the sole authority for which
@@ -2782,6 +2899,7 @@ def main():
     lp.add_argument("--result", help="outcome (e.g. pass/fail/escalated)")
     lp.add_argument("--project")
     lp.add_argument("--note")
+    lp.add_argument("--usage-v2", help="bounded JSON evidence with stable usage identity; optional")
     lp.add_argument("--person", dest="person_id",
                     help="person this spend is attributed to (dispatcher-"
                          "declared id, never worker self-reported); omit to "

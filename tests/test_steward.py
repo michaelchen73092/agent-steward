@@ -2276,3 +2276,90 @@ def test_allocate_tune_axes_spec_rejects_a_tier_smuggled_in(tmp_path):
     assert r.returncode != 0
     assert "judgment" in r.stderr
     assert apath.read_text(encoding="utf-8") == before
+
+
+def _usage_v2_fixture(event="attempt:terminal", namespace="fixture"):
+    return {"schema_version": 1, "identity_status": "complete",
+            "namespace": namespace, "attempt_id": "attempt", "source_event_id": event,
+            "segment_id": "terminal", "observed_epoch": 1234,
+            "cause_status": "unknown", "outcome_status": "unverified",
+            "usage": {"quantities": {"output_tokens": 12},
+                      "missing_quantities": ["input_tokens", "cache_creation_input_tokens",
+                                             "cache_read_input_tokens"],
+                      "invalid_quantities": [], "usage_status": "partial",
+                      "measurement_method": "fixture", "aggregation": "terminal_aggregate",
+                      "reported_cost_usd": None, "cost_method": "provider_reported_not_invoice",
+                      "execution_status": "returned", "side_effect_status": "not_assessed"}}
+
+
+def _usage_v2_command(tmp_path, envelope, note="same"):
+    allocation = tmp_path / "allocation.yaml"
+    allocation.write_text("tier_patterns: {}\n")
+    cmd = [sys.executable, "-m", "agent_steward.cli", "log-task", "--task", "fixture",
+           "--tier", "mid", "--note", note, "--state-dir", str(tmp_path / "state"),
+           "--allocation", str(allocation)]
+    if envelope is not None:
+        cmd += ["--usage-v2", json.dumps(envelope)]
+    env = dict(os.environ, PYTHONPATH=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+    return cmd, env
+
+
+def _usage_v2_run(tmp_path, envelope, note="same"):
+    cmd, env = _usage_v2_command(tmp_path, envelope, note)
+    return subprocess.run(cmd, env=env, cwd=tmp_path, capture_output=True, text=True)
+
+
+def test_usage_v2_canonical_identity_precedes_note(tmp_path):
+    envelope = _usage_v2_fixture()
+    assert _usage_v2_run(tmp_path, envelope).returncode == 0
+    assert _usage_v2_run(tmp_path, envelope, "different").returncode == 0
+    assert _usage_v2_run(tmp_path, _usage_v2_fixture("different:terminal")).returncode == 0
+    assert _usage_v2_run(tmp_path, _usage_v2_fixture(namespace="other")).returncode == 0
+    rows = (tmp_path / "state/usage_ledger.jsonl").read_text().splitlines()
+    assert len(rows) == 3
+    assert all(json.loads(row)["usage_v2"]["identity_status"] == "complete" for row in rows)
+
+
+def test_usage_v2_conflict_does_not_append(tmp_path):
+    envelope = _usage_v2_fixture()
+    assert _usage_v2_run(tmp_path, envelope).returncode == 0
+    path = tmp_path / "state/usage_ledger.jsonl"
+    before = path.read_bytes()
+    envelope["usage"]["quantities"]["output_tokens"] = 13
+    result = _usage_v2_run(tmp_path, envelope)
+    assert result.returncode == 1 and "conflicting usage identity" in result.stderr
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("bad", [True, -1, float("nan"), float("inf"), "12", None])
+def test_usage_v2_invalid_measurement_never_appends(tmp_path, bad):
+    envelope = _usage_v2_fixture()
+    envelope["usage"]["quantities"]["output_tokens"] = bad
+    assert _usage_v2_run(tmp_path, envelope).returncode == 1
+    assert not (tmp_path / "state/usage_ledger.jsonl").exists()
+
+
+def test_usage_v2_rejects_raw_payload(tmp_path):
+    envelope = _usage_v2_fixture()
+    envelope["usage"]["raw_prompt"] = "must-not-be-logged"
+    result = _usage_v2_run(tmp_path, envelope)
+    assert result.returncode == 1 and "must-not-be-logged" not in result.stdout + result.stderr
+    assert not (tmp_path / "state/usage_ledger.jsonl").exists()
+
+
+def test_usage_v2_does_not_infer_identity_from_legacy_note(tmp_path):
+    assert _usage_v2_run(tmp_path, None).returncode == 0
+    assert _usage_v2_run(tmp_path, _usage_v2_fixture()).returncode == 0
+    rows = [json.loads(row) for row in (tmp_path / "state/usage_ledger.jsonl").read_text().splitlines()]
+    assert len(rows) == 2 and "usage_v2" not in rows[0]
+    assert rows[1]["usage_v2"]["namespace"] == "fixture"
+
+
+def test_usage_v2_concurrent_replay_is_atomic(tmp_path):
+    cmd, env = _usage_v2_command(tmp_path, _usage_v2_fixture())
+    workers = [subprocess.Popen(cmd, env=env, cwd=tmp_path, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True) for _ in range(4)]
+    results = [worker.communicate(timeout=20) for worker in workers]
+    assert all(worker.returncode == 0 for worker in workers), results
+    rows = (tmp_path / "state/usage_ledger.jsonl").read_text().splitlines()
+    assert len(rows) == 1 and json.loads(rows[0])["usage_v2"]["usage"]["quantities"] == {"output_tokens": 12}
