@@ -43,6 +43,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter
 
 try:
@@ -1125,6 +1126,53 @@ def diff_violations(prev, cur):
             resolved[pid] = gone
     return new, resolved
 
+
+def _violation_is_fresh(v, root, grace, now):
+    """True if violation `v` ("<rel/path>: message") names a file under `root`
+    whose mtime is within `grace` seconds of `now`. Anything unparseable or
+    unreadable -> False (fail-open: the violation is reported as usual)."""
+    head = str(v).split(":", 1)[0].strip()
+    if not head or " " in head:
+        return False
+    try:
+        path = os.path.join(root, head)
+        return os.path.isfile(path) and (now - os.path.getmtime(path)) < grace
+    except OSError:
+        return False
+
+
+def hold_fresh_violations(new_v, cur, root, grace, now):
+    """Hold back *new* violations on files still being written.
+
+    A multi-file batch written over several minutes is seen mid-write by a
+    frequent `check --diff --exit-new` (e.g. a Stop hook): each run flags a
+    different subset of half-written files as "new", and each subset heals on
+    its own. With `fresh_grace_sec` > 0, a new violation on a file modified
+    within the grace window is not reported yet AND is left out of the saved
+    state, so if it is still there once the file settles it is reported as new
+    on a later run. Returns (new_v, cur_for_state, held). grace <= 0 -> no-op.
+    """
+    if not grace or grace <= 0:
+        return new_v, cur, {}
+    held, kept = {}, {}
+    for pid, vs in new_v.items():
+        for v in vs:
+            bucket = held if _violation_is_fresh(v, root, grace, now) else kept
+            bucket.setdefault(pid, []).append(v)
+    if not held:
+        return new_v, cur, {}
+    cur_state = {}
+    for pid, vs in cur.items():
+        drop = Counter(held.get(pid, []))
+        rest = []
+        for v in vs:
+            if drop[v] > 0:
+                drop[v] -= 1
+            else:
+                rest.append(v)
+        cur_state[pid] = rest
+    return kept, cur_state, held
+
 # ---------------------------------------------------------------- runner
 
 def run(manifest_path, root_override=None, out_override=None,
@@ -1238,11 +1286,13 @@ def run(manifest_path, root_override=None, out_override=None,
         cur = {r["probe"]: r["violations"] for r in results
                if r["violations"] or str(r["probe"]) in always_report_ids}
         new_v, resolved_v = diff_violations(prev, cur)
+        new_v, cur_state, held_v = hold_fresh_violations(
+            new_v, cur, root, float(mf.get("fresh_grace_sec") or 0), time.time())
         if prev_ran_at:  # don't count the very first baseline as "fixes"
             record_fixes(sdir, project, resolved_v)
         probe_meta = {str(s.get("id")): s for s in mf.get("probes", []) or []}
         state.setdefault("projects", {})[project] = {
-            "ran_at": now_iso(), "root": root, "violations": cur,
+            "ran_at": now_iso(), "root": root, "violations": cur_state,
             "metrics": metrics, "conflicts": conflicts,
             "coverage": ({k: coverage[k] for k in ("uncovered", "drift")} if coverage else None),
             # per-probe stats + fix guidance so the report can render the
@@ -1343,7 +1393,9 @@ def run(manifest_path, root_override=None, out_override=None,
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     n_new = sum(len(v) for v in new_v.values())
     n_res = sum(len(v) for v in resolved_v.values())
-    diff_note = f" new=+{n_new} resolved=-{n_res}" if diff else ""
+    n_held = sum(len(v) for v in held_v.values()) if diff else 0
+    diff_note = (f" new=+{n_new} resolved=-{n_res}" if diff else "") + (
+        f" held_fresh={n_held}" if n_held else "")
     cov_note = f" coverage={metrics['rule_coverage']}" if coverage else ""
     conf_note = f" CONFLICTS={len(conflicts)}" if conflicts else ""
     saved_note = (f" saved={savings['saved_vs_top_pct']}%"

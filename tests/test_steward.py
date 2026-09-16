@@ -6,6 +6,7 @@ All fixtures are built in tmp_path; nothing touches a real project.
 """
 import json
 import os
+import time
 import subprocess
 import sys
 
@@ -1660,6 +1661,39 @@ def test_exit_new_codes(tmp_path):
     r3 = steward_cli("check", "--manifest", manifest, "--diff", "--exit-new",
                      "--state-dir", state, "--out", str(tmp_path / "o3"))
     assert r3.returncode == 0                      # unchanged -> 0 (not new)
+
+
+def test_exit_new_fresh_grace_holds_in_flight_files(tmp_path):
+    # a file still being written (mtime inside fresh_grace_sec) is not reported
+    # as new yet, and is kept out of saved state -> reported once it settles
+    proj = tmp_path / "proj"
+    write(proj, "facts/2026/ok.md", FACT_OK)
+    manifest = make_manifest(tmp_path, proj, extra={"fresh_grace_sec": 300})
+    state = str(tmp_path / "state")
+    args = ("check", "--manifest", manifest, "--diff", "--exit-new", "--state-dir", state)
+    assert steward_cli(*args, "--out", str(tmp_path / "o1")).returncode == 0
+    write(proj, "facts/2026/bad.md", "---\nid: f9\n---\nx\n")
+    r2 = steward_cli(*args, "--out", str(tmp_path / "o2"))
+    assert r2.returncode == 0, r2.stderr           # fresh -> held, not new
+    assert "held_fresh=1" in r2.stdout
+    old = time.time() - 3600
+    os.utime(proj / "facts/2026/bad.md", (old, old))
+    r3 = steward_cli(*args, "--out", str(tmp_path / "o3"))
+    assert r3.returncode == 2                      # settled + still bad -> new now
+    assert "facts/2026/bad.md" in r3.stderr
+
+
+def test_hold_fresh_violations_unit(tmp_path):
+    (tmp_path / "a.md").write_text("x", encoding="utf-8")
+    now = os.path.getmtime(tmp_path / "a.md") + 10
+    new_v = {"p": ["a.md: bad", "gone.md: bad"]}
+    cur = {"p": ["a.md: bad", "gone.md: bad", "old.md: bad"], "q": []}
+    kept, cur_state, held = cli.hold_fresh_violations(new_v, cur, str(tmp_path), 300, now)
+    assert held == {"p": ["a.md: bad"]}
+    assert kept == {"p": ["gone.md: bad"]}          # missing file -> fail-open, reported
+    assert cur_state == {"p": ["gone.md: bad", "old.md: bad"], "q": []}
+    # grace 0 = unchanged behaviour (default)
+    assert cli.hold_fresh_violations(new_v, cur, str(tmp_path), 0, now) == (new_v, cur, {})
 
 
 def test_install_hook(tmp_path):

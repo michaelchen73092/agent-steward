@@ -3,6 +3,16 @@
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
+## 0.31.0 — 2026-09-16
+- Feature (T-20260916-27): manifest key `fresh_grace_sec` (default 0 = unchanged).
+  With `check --diff`, a *new* violation on a file whose mtime is within the
+  grace window is held back (console `held_fresh=N`) and left out of the saved
+  state, so it is reported as new on a later run only if it is still there once
+  the file settles. Why: a multi-file batch written over several minutes was
+  seen mid-write by the per-session Stop hook three runs in a row; each run
+  flagged a different, self-healing subset as "new", and that noise was turned
+  into a work item. Missing/unparseable paths fail open (reported as before).
+
 ## 0.30.0 — 2026-09-02
 - Feature (T-20260902-57): `steward allocate tune --axes-spec SPEC.yaml
   [--apply]` — the third way a tier table legitimately changes. The existing
