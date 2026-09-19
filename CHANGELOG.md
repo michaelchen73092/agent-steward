@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.32.0
+
+- Add optional bounded `log-task --usage-v2` evidence with canonical source identity.
+- Serialize ledger scan and append; identical retries are idempotent and conflicting payloads are rejected. Distinct attempts retain separate measurements.
+- Preserve legacy CLI behavior and existing ledger history.
+
+
 All notable changes to agent-steward. Version numbers follow semver-ish
 pragmatism: minor bumps for features, patch bumps for docs/fixes.
 
